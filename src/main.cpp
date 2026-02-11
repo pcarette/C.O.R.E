@@ -1,9 +1,13 @@
 #include <chrono>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
+#include <vector>
 
 #include "encoder.hpp"
 #include "loader.hpp"
+
+static volatile char sink;
 
 void print_bits(const uint64_t block) {
 	for (int i = 0; i < 32; ++i) {
@@ -30,29 +34,35 @@ int main(const int argc, char **argv) {
 	std::cout << "[CORE] Target: " << filepath << std::endl;
 
 	try {
-		const auto start_load = std::chrono::high_resolution_clock::now();
 		const GenomeLoader loader(filepath);
-		const auto end_load = std::chrono::high_resolution_clock::now();
+		std::cout << "[CORE] File mapped. Size: " << (loader.size() / 1024.0 / 1024.0) << " MB" << std::endl;
+		std::cout << "[CORE] Warming up RAM (Pre-faulting)..." << std::endl;
+		const auto start_warm = std::chrono::high_resolution_clock::now();
 
-		const double size_mb = loader.size() / 1024.0 / 1024.0;
-		const double time_load_ms =
-			std::chrono::duration_cast<std::chrono::microseconds>(end_load - start_load).count() / 1000.0;
+		const uint8_t *data = loader.data();
+		const size_t size = loader.size();
+		constexpr size_t page_size = 4096;
+		for (size_t i = 0; i < size; i += page_size)
+			sink = data[i];
 
-		std::cout << "[CORE] IO Load Complete." << std::endl;
-		std::cout << "       Size: " << std::fixed << std::setprecision(2) << size_mb << " MB" << std::endl;
-		std::cout << "       Time: " << time_load_ms << " ms" << std::endl;
-		std::cout << "[CORE] Executing Encoding..." << std::endl;
+		const auto end_warm = std::chrono::high_resolution_clock::now();
+		const double warm_ms =
+			std::chrono::duration_cast<std::chrono::microseconds>(end_warm - start_warm).count() / 1000.0;
+		std::cout << "[CORE] Warmup Complete. Disk/OS Latency: " << warm_ms << " ms" << std::endl;
 
+		std::cout << "[CORE] Executing AVX2 Encoding (RAM Resident)..." << std::endl;
 		const auto start_enc = std::chrono::high_resolution_clock::now();
-		const auto encoded_data = loader.encode();
+		const auto encoded_data = encode_sequence_avx2(reinterpret_cast<const uint8_t *>(data), size);
 		const auto end_enc = std::chrono::high_resolution_clock::now();
 		const double enc_time_ms =
 			std::chrono::duration_cast<std::chrono::microseconds>(end_enc - start_enc).count() / 1000.0;
-		const double gbps = (loader.size() / 1e9) / (enc_time_ms / 1000.0);
+		const double size_gb = loader.size() * 8.0 / 1e9;
+		const double throughput_gbps = size_gb / (enc_time_ms / 1000.0);
 
-		std::cout << "[CORE] Encoding Complete." << std::endl;
-		std::cout << "       Time: " << enc_time_ms << " ms" << std::endl;
-		std::cout << "       Throughput: " << gbps << " Gb/s" << std::endl;
+		std::cout << "------------------------------------------------" << std::endl;
+		std::cout << "  Encoding Time : " << enc_time_ms << " ms" << std::endl;
+		std::cout << "  CPU Throughput: " << throughput_gbps << " Gb/s" << std::endl;
+		std::cout << "------------------------------------------------" << std::endl;
 
 		std::cout << "\n[DEBUG] First Block Preview (32 bases):" << std::endl;
 		if (!encoded_data.empty()) {
