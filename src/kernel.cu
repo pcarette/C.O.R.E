@@ -13,11 +13,13 @@ __global__ void __launch_bounds__(256) k_search_exact(
     uint32_t max_capacity,
     size_t global_offset
 ) {
+    uint64_t local_pattern = pattern_val;
+    local_pattern = __shfl_sync(0xffffffff, local_pattern, 0);
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     size_t stride = blockDim.x * gridDim.x;
     for (size_t i = idx; i < n; i += stride) {
         uint64_t chunk = genome[i];
-        if ((chunk ^ pattern_val) == 0) {
+        if (__popcll(chunk ^ local_pattern) == 0) {
             uint32_t write_idx = atomicAdd(match_count, 1);
             if (write_idx < max_capacity) {
                 match_indices[write_idx] = (uint32_t)(global_offset + i);
