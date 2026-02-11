@@ -6,7 +6,7 @@ UseTab:          Always
 IndentWidth:     4
 TabWidth:        4
 ContinuationIndentWidth: 4
-ColumnLimit:     120
+ColumnLimit:     130
 PointerAlignment: Right
 SortIncludes:    true
 FixNamespaceComments: true
