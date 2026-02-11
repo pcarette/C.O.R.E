@@ -60,6 +60,42 @@ public:
 	}
 };
 
+template <typename T> class PinnedHostBuffer {
+	T *ptr_ = nullptr;
+	size_t size_ = 0;
+
+public:
+	explicit PinnedHostBuffer(size_t size) : size_(size) {
+		if (size > 0)
+			CHECK_CUDA(cudaMallocHost(&ptr_, size * sizeof(T)));
+	}
+
+	~PinnedHostBuffer() {
+		if (ptr_)
+			cudaFreeHost(ptr_);
+	}
+
+	PinnedHostBuffer(const PinnedHostBuffer&) = delete;
+
+	PinnedHostBuffer& operator=(const PinnedHostBuffer&) = delete;
+
+	T *data() const {
+		return ptr_;
+	}
+
+	size_t size() const {
+		return size_;
+	}
+
+	T &operator[](size_t index) {
+		return ptr_[index];
+	}
+
+	const T &operator[](size_t index) const {
+		return ptr_[index];
+	}
+};
+
 class CudaEvent {
 	cudaEvent_t event_;
 
