@@ -52,7 +52,7 @@ int main(const int argc, char **argv) {
 
 		std::cout << "[CORE] Executing AVX2 Encoding (RAM Resident)..." << std::endl;
 		const auto start_enc = std::chrono::high_resolution_clock::now();
-		const auto encoded_data = encode_sequence_avx2(reinterpret_cast<const uint8_t *>(data), size);
+		const auto encoded_data = encode_sequence_avx2(data, size);
 		const auto end_enc = std::chrono::high_resolution_clock::now();
 		const double enc_time_ms =
 			std::chrono::duration_cast<std::chrono::microseconds>(end_enc - start_enc).count() / 1000.0;
