@@ -54,5 +54,5 @@ std::string_view GenomeLoader::get_view() const {
 }
 
 AlignedVector GenomeLoader::encode() const {
-	return encode_sequence_avx512(data_, size_);
+	return encode_sequence_avx2(data_, size_);
 }

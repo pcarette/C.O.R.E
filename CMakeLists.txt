@@ -57,8 +57,7 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
 			-O3
 			-march=native
 			-mtune=native
-			-mavx512f
-			-mavx512bw
+			-mavx2
 			-mbmi2
 			-funroll-loops
 			-Wall -Wextra -Werror

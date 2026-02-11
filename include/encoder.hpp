@@ -38,4 +38,4 @@ template <class T, class U> bool operator!=(const AlignedAllocator<T> &, const A
 
 using AlignedVector = std::vector<uint64_t, AlignedAllocator<uint64_t>>;
 
-AlignedVector encode_sequence_avx512(const uint8_t *data, size_t size);
+AlignedVector encode_sequence_avx2(const uint8_t  *__restrict__ data, size_t size);
