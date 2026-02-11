@@ -1,39 +1,83 @@
 cmake_minimum_required(VERSION 3.31)
 
-project(core CXX CUDA)
+project(CORE_ENGINE
+		VERSION 1.0.0
+		DESCRIPTION "High Performance Genomics Engine"
+		LANGUAGES CXX C CUDA
+)
 
-set(CMAKE_CUDA_STANDARD 20)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-include_directories(BEFORE SYSTEM "${CMAKE_SOURCE_DIR}/cuda_fix")
-
-if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-	add_compile_options(-O3 -Wall -Wextra -Werror -march=native -mtune=native -fopenmp -mavx512f -mavx512bw)
+include(CheckIPOSupported)
+check_ipo_supported(RESULT result OUTPUT output)
+if (result)
+	message(STATUS "[INFO] Link Time Optimization (LTO) enabled for Release builds")
+	set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+else ()
+	message(WARNING "[WARN] LTO not supported by this compiler: ${output}")
 endif ()
-
-set(CMAKE_CUDA_FLAGS "-O3 --cuda-gpu-arch=sm_86 --cuda-gpu-arch=sm_89 -Wno-unknown-cuda-version -ffast-math")
-set(CMAKE_CUDA_ARCHITECTURES 86 89)
 
 find_package(OpenMP REQUIRED COMPONENTS CXX)
 find_package(Python COMPONENTS Interpreter Development REQUIRED)
 find_package(pybind11 CONFIG REQUIRED)
 
-add_library(cuda_core STATIC src/kernel.cu)
-target_include_directories(cuda_core PUBLIC include)
-set_target_properties(cuda_core PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+include_directories(include)
 
-pybind11_add_module(core_engine
-		src/main.cpp
+add_library(cuda_core STATIC src/kernel.cu)
+
+set_target_properties(cuda_core PROPERTIES
+		CUDA_SEPARABLE_COMPILATION ON
+		CUDA_ARCHITECTURES "86;89"
+)
+
+target_compile_options(cuda_core PRIVATE
+		$<$<COMPILE_LANGUAGE:CUDA>:
+		-O3
+		-ffast-math
+		-Wno-unknown-cuda-version
+		-Wall -Wextra
+		>
+)
+
+add_library(core_logic STATIC
 		src/loader.cpp
 		src/encoder.cpp
 )
 
-target_link_libraries(core_engine PRIVATE cuda_core OpenMP::OpenMP_CXX)
-target_include_directories(core_engine PRIVATE include)
+target_link_libraries(core_logic PUBLIC cuda_core OpenMP::OpenMP_CXX)
 
-message(STATUS "--- C.O.R.E CONFIGURATION ---")
-message(STATUS "Mode: LOCAL SYSTEM (No Internet Fetch)")
-message(STATUS "Target GPU: Ampere (sm_86) & Ada Lovelace (sm_89)")
-message(STATUS "-------------------------------")
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+	target_compile_options(core_logic PRIVATE
+			-O3
+			-march=native
+			-mtune=native
+			-mavx512f
+			-mavx512bw
+			-mbmi2
+			-funroll-loops
+			-Wall -Wextra -Werror
+			-Wno-unused-parameter
+	)
+endif ()
+
+add_executable(core_runner src/main.cpp)
+target_link_libraries(core_runner PRIVATE core_logic)
+
+pybind11_add_module(core_engine src/python_bindings.cpp)
+target_link_libraries(core_engine PRIVATE core_logic)
+
+message(STATUS "--------------------------------------------------")
+message(STATUS "  C.O.R.E ENGINE - BUILD CONFIGURATION")
+message(STATUS "--------------------------------------------------")
+message(STATUS "  * System      : ${CMAKE_SYSTEM_NAME} (${CMAKE_SYSTEM_PROCESSOR})")
+message(STATUS "  * CXX Compiler: ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
+message(STATUS "  * CUDA Target : sm_86, sm_89 (Clang Native Mode)")
+message(STATUS "  * Build Type  : ${CMAKE_BUILD_TYPE}")
+message(STATUS "  * Components  : Core Logic, Runner, Python Module")
+message(STATUS "--------------------------------------------------")
