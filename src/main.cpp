@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "encoder.hpp"
+#include "kernel.hpp"
 #include "loader.hpp"
 
 static volatile char sink;
@@ -69,6 +70,16 @@ int main(const int argc, char **argv) {
 			std::cout << "       Bin: ";
 			print_bits(encoded_data[0]);
 			std::cout << "\n       Hex: 0x" << std::hex << encoded_data[0] << std::dec << std::endl;
+			std::cout << "\n[CORE] Launching GPU Search (Exact Match)..." << std::endl;
+			std::cout << "       Query: Same as First Block" << std::endl;
+			SearchResults res = launch_exact_search(encoded_data.data(), encoded_data.size(), encoded_data[0]);
+			std::cout << "------------------------------------------------" << std::endl;
+			std::cout << "  GPU Time      : " << res.time_ms << " ms" << std::endl;
+			std::cout << "  Matches Found : " << res.count << std::endl;
+			std::cout << "------------------------------------------------" << std::endl;
+			if (res.count > 0)
+				std::cout << "[DEBUG] First Match Index: " << res.matches[0] << std::endl;
+			free_search_results(res);
 		}
 	} catch (const std::exception &e) {
 		std::cerr << "[FATAL] " << e.what() << std::endl;
