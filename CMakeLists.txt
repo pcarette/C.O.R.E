@@ -26,6 +26,7 @@ endif ()
 find_package(OpenMP REQUIRED COMPONENTS CXX)
 find_package(Python COMPONENTS Interpreter Development REQUIRED)
 find_package(pybind11 CONFIG REQUIRED)
+find_package(CUDAToolkit REQUIRED)
 
 include_directories(include)
 
@@ -65,10 +66,10 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
 endif ()
 
 add_executable(core_runner src/main.cpp)
-target_link_libraries(core_runner PRIVATE cuda_core core_logic)
+target_link_libraries(core_runner PRIVATE cuda_core core_logic CUDA::cudart)
 
 pybind11_add_module(core_engine src/python_bindings.cpp)
-target_link_libraries(core_engine PRIVATE cuda_core core_logic)
+target_link_libraries(core_engine PRIVATE cuda_core core_logic CUDA::cudart)
 
 message(STATUS "--------------------------------------------------")
 message(STATUS "  C.O.R.E ENGINE - BUILD CONFIGURATION")
