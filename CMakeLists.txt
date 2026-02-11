@@ -27,6 +27,7 @@ set_target_properties(cuda_core PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 pybind11_add_module(core_engine
 		src/main.cpp
 		src/loader.cpp
+		src/encoder.cpp
 )
 
 target_link_libraries(core_engine PRIVATE cuda_core OpenMP::OpenMP_CXX)

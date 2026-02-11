@@ -52,3 +52,7 @@ GenomeLoader &GenomeLoader::operator=(GenomeLoader &&other) noexcept {
 std::string_view GenomeLoader::get_view() const {
 	return {reinterpret_cast<const char *>(data_), size_};
 }
+
+AlignedVector GenomeLoader::encode() const {
+	return encode_sequence_avx512(data_, size_);
+}
