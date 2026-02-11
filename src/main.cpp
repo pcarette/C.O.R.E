@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "encoder.hpp"
+#include "gpu_utils.hpp"
 #include "kernel.hpp"
 #include "loader.hpp"
 
@@ -28,7 +29,8 @@ uint64_t make_pattern(const std::string &seq) {
 	uint64_t pat = 0;
 	for (size_t i = 0; i < seq.length() && i < 32; ++i) {
 		uint64_t val = 0;
-		if (const char c = seq[i]; c == 'C')
+		char c = seq[i];
+		if (c == 'C')
 			val = 1;
 		else if (c == 'G')
 			val = 2;
@@ -53,7 +55,6 @@ int main(const int argc, char **argv) {
 		const GenomeLoader loader(filepath);
 		std::cout << "[CORE] File mapped. Size: " << (loader.size() / 1024.0 / 1024.0) << " MB" << std::endl;
 		std::cout << "[CORE] Warming up RAM (Pre-faulting)..." << std::endl;
-		const auto start_warm = std::chrono::high_resolution_clock::now();
 
 		const uint8_t *data = loader.data();
 		const size_t size = loader.size();
@@ -61,56 +62,35 @@ int main(const int argc, char **argv) {
 		for (size_t i = 0; i < size; i += page_size)
 			sink = data[i];
 
-		const auto end_warm = std::chrono::high_resolution_clock::now();
-		const double warm_ms = std::chrono::duration_cast<std::chrono::microseconds>(end_warm - start_warm).count() / 1000.0;
-		std::cout << "[CORE] Warmup Complete. Disk/OS Latency: " << warm_ms << " ms" << std::endl;
-
-		std::cout << "[CORE] Executing AVX2 Encoding (RAM Resident)..." << std::endl;
+		const size_t num_blocks = (size + 31) / 32;
+		std::cout << "[CORE] Allocating Pinned Memory (" << (num_blocks * 8.0 / 1024 / 1024) << " MB)..." << std::endl;
+		PinnedHostBuffer<uint64_t> pinned_genome(num_blocks);
+		std::cout << "[CORE] Executing AVX2 Encoding (Direct to Pinned)..." << std::endl;
 		const auto start_enc = std::chrono::high_resolution_clock::now();
-		auto encoded_data = encode_sequence_avx2(data, size);
+		encode_sequence_avx2(data, size, pinned_genome.data());
 		const auto end_enc = std::chrono::high_resolution_clock::now();
 		const double enc_time_ms = std::chrono::duration_cast<std::chrono::microseconds>(end_enc - start_enc).count() / 1000.0;
-		const double size_gb = loader.size() * 8.0 / 1e9;
-		const double throughput_gbps = size_gb / (enc_time_ms / 1000.0);
+		const double throughput_gbps = (size * 8.0 / 1e9) / (enc_time_ms / 1000.0);
 
 		std::cout << "------------------------------------------------" << std::endl;
 		std::cout << "  Encoding Time : " << enc_time_ms << " ms" << std::endl;
-		std::cout << "  CPU Throughput: " << throughput_gbps << " Gb/s" << std::endl;
+		std::cout << "  Throughput    : " << throughput_gbps << " Gb/s" << std::endl;
 		std::cout << "------------------------------------------------" << std::endl;
-
-		if (!encoded_data.empty()) {
-			const std::string signature = "ACGTACGTACGTACGTACGTACGTACGTACGT";
-			const uint64_t unique_pattern = make_pattern(signature);
-			encoded_data[0] = unique_pattern;
-			std::cout << "\n[CORE] --- SECRET WEAPON TEST: BULGE/INDEL ---" << std::endl;
-			std::cout << "Target (Index 0)     : ";
-			print_bits(unique_pattern);
-			std::cout << std::endl;
-			const uint64_t bulged_pattern = unique_pattern << 2;
-			std::cout << "Query (Shifted << 1) : ";
-			print_bits(bulged_pattern);
-			std::cout << std::endl;
-			std::cout << "\n[TEST A] Exact Search on Shifted Pattern..." << std::endl;
-			SearchResults res1 = launch_exact_search(encoded_data.data(), encoded_data.size(), bulged_pattern);
-			std::cout << " -> Matches: " << res1.count << " (Expected 0)" << std::endl;
-			free_search_results(res1);
-			std::cout << "\n[TEST B] Bulge Search (Auto-Shift Detection)..." << std::endl;
-			SearchResults res2 = launch_bulge_search(encoded_data.data(), encoded_data.size(), bulged_pattern, 2);
-			std::cout << "------------------------------------------------" << std::endl;
-			std::cout << "  Matches Found : " << res2.count << std::endl;
-			std::cout << "  GPU Time      : " << res2.time_ms << " ms" << std::endl;
-			if (res2.count > 0) {
-				std::cout << "  First Index   : " << res2.matches[0] << " (Target: 0)" << std::endl;
-				if (res2.matches[0] == 0) {
-					std::cout << "  [SUCCESS] TARGET LOCKED. Engine Validated." << std::endl;
-				} else {
-					std::cout << "  [FAIL] Target Missed." << std::endl;
-				}
+		if (pinned_genome.size() > 0) {
+			std::string signature = "ACGTACGTACGTACGTACGTACGTACGTACGT";
+			uint64_t unique_pattern = make_pattern(signature);
+			pinned_genome[0] = unique_pattern;
+			std::cout << "\n[CORE] --- VALIDATION: PINNED MEMORY SEARCH ---" << std::endl;
+			uint64_t bulged_pattern = unique_pattern << 2;
+			SearchResults res = launch_bulge_search(pinned_genome.data(), pinned_genome.size(), bulged_pattern, 2);
+			std::cout << "  Matches Found : " << res.count << std::endl;
+			std::cout << "  GPU Time      : " << res.time_ms << " ms" << std::endl;
+			if (res.count > 0 && res.matches[0] == 0) {
+				std::cout << "  [SUCCESS] TARGET LOCKED via DMA." << std::endl;
 			} else {
-				std::cout << "  [FAIL] No Match Found." << std::endl;
+				std::cout << "  [FAIL] Target Missed." << std::endl;
 			}
-			std::cout << "------------------------------------------------" << std::endl;
-			free_search_results(res2);
+			free_search_results(res);
 		}
 	} catch (const std::exception &e) {
 		std::cerr << "[FATAL] " << e.what() << std::endl;

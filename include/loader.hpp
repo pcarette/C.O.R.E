@@ -3,8 +3,6 @@
 #include <cstdint>
 #include <string_view>
 
-#include "encoder.hpp"
-
 class GenomeLoader {
 	uint8_t *data_;
 	size_t size_;
@@ -35,6 +33,4 @@ public:
 	size_t size() const {
 		return size_;
 	}
-
-	AlignedVector encode() const;
 };

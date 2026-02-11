@@ -1,5 +1,6 @@
 #include <cstring>
 #include <immintrin.h>
+#include <omp.h>
 
 #include "encoder.hpp"
 
@@ -24,15 +25,13 @@ static __always_inline uint8_t encode_char_scalar(const char c) {
 
 static __always_inline uint64_t process_block_32(const __m256i &raw) {
 	const __m256i vals = _mm256_shuffle_epi8(SHUFFLE_LUT, raw);
-	const uint32_t mask0 = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_slli_epi16(vals, 7)));
-	const uint32_t mask1 = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_slli_epi16(vals, 6)));
+	const auto mask0 = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_slli_epi16(vals, 7)));
+	const auto mask1 = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_slli_epi16(vals, 6)));
 	return _pdep_u64(mask0, MASK_ODD) | _pdep_u64(mask1, MASK_EVEN);
 }
 
-AlignedVector encode_sequence_avx2(const uint8_t *__restrict__ data, const size_t size) {
+size_t encode_sequence_avx2(const uint8_t *__restrict__ data, const size_t size, uint64_t *__restrict__ output_buffer) {
 	const size_t num_u64 = (size + 31) / 32;
-	AlignedVector result(num_u64);
-	uint64_t *__restrict__ res_ptr = result.data();
 	const size_t chunks_256 = size / 256;
 
 #pragma omp parallel for schedule(dynamic, 1024)
@@ -57,8 +56,8 @@ AlignedVector encode_sequence_avx2(const uint8_t *__restrict__ data, const size_
 		const uint64_t v7 = process_block_32(r7);
 		const __m256i out_vec_a = _mm256_set_epi64x(v3, v2, v1, v0);
 		const __m256i out_vec_b = _mm256_set_epi64x(v7, v6, v5, v4);
-		_mm256_stream_si256(res_ptr + out_offset, out_vec_a);
-		_mm256_stream_si256(res_ptr + out_offset + 4, out_vec_b);
+		_mm256_stream_si256(output_buffer + out_offset, out_vec_a);
+		_mm256_stream_si256(output_buffer + out_offset + 4, out_vec_b);
 	}
 
 	size_t processed_bytes = chunks_256 * 256;
@@ -66,7 +65,7 @@ AlignedVector encode_sequence_avx2(const uint8_t *__restrict__ data, const size_
 
 	for (size_t k = processed_bytes; k + 32 <= size; k += 32) {
 		__m256i r = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(data + k));
-		result[block_idx++] = process_block_32(r);
+		output_buffer[block_idx++] = process_block_32(r);
 		processed_bytes += 32;
 	}
 
@@ -80,11 +79,10 @@ AlignedVector encode_sequence_avx2(const uint8_t *__restrict__ data, const size_
 			current_block |= (static_cast<uint64_t>(val) << bit_pos);
 			bit_pos += 2;
 		}
-
-		result[block_idx] = current_block;
+		output_buffer[block_idx] = current_block;
 	}
 
 	_mm_sfence();
 
-	return result;
+	return num_u64;
 }
