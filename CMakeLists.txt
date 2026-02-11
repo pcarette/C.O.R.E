@@ -10,7 +10,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 include_directories(BEFORE SYSTEM "${CMAKE_SOURCE_DIR}/cuda_fix")
 
 if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-	add_compile_options(-O3 -Wall -Wextra -Werror -march=native -mtune=native -fopenmp)
+	add_compile_options(-O3 -Wall -Wextra -Werror -march=native -mtune=native -fopenmp -mavx512f -mavx512bw)
 endif ()
 
 set(CMAKE_CUDA_FLAGS "-O3 --cuda-gpu-arch=sm_86 --cuda-gpu-arch=sm_89 -Wno-unknown-cuda-version -ffast-math")
