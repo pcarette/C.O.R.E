@@ -1,5 +1,8 @@
+#include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstring>
+#include <iomanip>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -9,7 +12,7 @@
 #include "kernel.hpp"
 #include "loader.hpp"
 
-static volatile unsigned char sink;
+static volatile uint8_t sink;
 
 void print_bits(const uint64_t block) {
 	for (int i = 0; i < 32; ++i) {
@@ -29,7 +32,7 @@ uint64_t make_pattern(const std::string &seq) {
 	uint64_t pat = 0;
 	for (size_t i = 0; i < seq.length() && i < 32; ++i) {
 		uint64_t val = 0;
-		if (const char c = seq[i]; c == 'C')
+		if (const char c = std::toupper(seq[i]); c == 'C')
 			val = 1;
 		else if (c == 'G')
 			val = 2;
@@ -40,61 +43,154 @@ uint64_t make_pattern(const std::string &seq) {
 	return pat;
 }
 
+std::string get_reverse_complement(const std::string &seq) {
+	std::string rc = "";
+	for (int i = seq.length() - 1; i >= 0; i--) {
+		const char c = std::toupper(seq[i]);
+		if (c == 'A')
+			rc += 'T';
+		else if (c == 'T')
+			rc += 'A';
+		else if (c == 'C')
+			rc += 'G';
+		else if (c == 'G')
+			rc += 'C';
+		else
+			rc += 'N';
+	}
+	return rc;
+}
+
+std::vector<uint8_t> sanitize_genome(const uint8_t *raw_data, size_t raw_size, double &duration_ms) {
+	const auto start = std::chrono::high_resolution_clock::now();
+	std::vector<uint8_t> clean_data;
+	clean_data.reserve(raw_size);
+
+	bool in_header = false;
+	for (size_t i = 0; i < raw_size; ++i) {
+		uint8_t c = raw_data[i];
+		if (in_header) {
+			if (c == '\n')
+				in_header = false;
+			continue;
+		}
+		if (c == '>') {
+			in_header = true;
+			continue;
+		}
+		if (c == '\n' || c == '\r' || c == ' ' || c == '\t')
+			continue;
+		clean_data.push_back(c);
+	}
+
+	const auto end = std::chrono::high_resolution_clock::now();
+	duration_ms = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0;
+	return clean_data;
+}
+
 int main(const int argc, char **argv) {
-	if (argc < 2) {
-		std::cerr << "Usage: ./core_runner <file.fasta>" << std::endl;
+	if (argc < 3) {
+		std::cerr << "Usage: ./core_runner <file.fasta> <TARGET_SEQUENCE>" << std::endl;
 		return 1;
 	}
 
 	const std::string filepath = argv[1];
-	std::cout << "[CORE] Starting engine benchmark..." << std::endl;
-	std::cout << "[CORE] Target: " << filepath << std::endl;
+	const std::string target_seq = argv[2];
+
+	if (target_seq.length() >= 23) {
+		const char pam1 = std::toupper(target_seq[21]);
+		const char pam2 = std::toupper(target_seq[22]);
+		if (pam1 != 'G' || pam2 != 'G') {
+			std::cout << "[WARN] Target does not end with 'GG' (PAM). Kernel filter will likely reject it." << std::endl;
+		}
+	}
+
+	std::cout << "[CORE] Starting REAL WORLD benchmark..." << std::endl;
+	std::cout << "[CORE] Target File : " << filepath << std::endl;
+	std::cout << "[CORE] Query Seq   : " << target_seq << " (" << target_seq.length() << " bp)" << std::endl;
+	std::cout << "================================================================" << std::endl;
 
 	try {
+		const auto t_global_start = std::chrono::high_resolution_clock::now();
+
+		std::cout << "[STEP 1] Memory Mapping..." << std::endl;
+		const auto t_load_start = std::chrono::high_resolution_clock::now();
 		const GenomeLoader loader(filepath);
-		const auto loader_d_size = static_cast<double>(loader.size());
-		std::cout << "[CORE] File mapped. Size: " << (loader_d_size / 1024.0 / 1024.0) << " MB" << std::endl;
-		std::cout << "[CORE] Warming up RAM (Pre-faulting)..." << std::endl;
+		const auto t_load_end = std::chrono::high_resolution_clock::now();
+		const double load_time = std::chrono::duration_cast<std::chrono::microseconds>(t_load_end - t_load_start).count() / 1000.0;
 
-		const uint8_t *data = loader.data();
-		const size_t size = loader.size();
-		constexpr size_t page_size = 4096;
-		for (size_t i = 0; i < size; i += page_size)
-			sink = data[i];
+		std::cout << "  > Mapped Size   : " << std::fixed << std::setprecision(2) << (loader.size() / 1024.0 / 1024.0) << " MB"
+				  << std::endl;
+		std::cout << "  > IO Time       : " << load_time << " ms" << std::endl;
 
-		std::cout << "[CORE] Allocating Pinned Memory (DMA Ready)..." << std::endl;
-		const size_t num_blocks = (size + 31) / 32;
+		const uint8_t *raw_data = loader.data();
+		const size_t raw_size = loader.size();
+		for (size_t i = 0; i < raw_size; i += 4096)
+			sink = raw_data[i];
+
+		std::cout << "[STEP 2] Sanitizing FASTA (Headers & Newlines removal)..." << std::endl;
+		double sanitize_time = 0;
+		const std::vector<uint8_t> clean_data = sanitize_genome(raw_data, raw_size, sanitize_time);
+		const size_t clean_size = clean_data.size();
+
+		const double ratio = static_cast<double>(clean_size) / raw_size * 100.0;
+		std::cout << "  > Raw Size      : " << (raw_size / 1024.0 / 1024.0) << " MB" << std::endl;
+		std::cout << "  > Clean Size    : " << (clean_size / 1024.0 / 1024.0) << " MB (" << ratio << "% genetic content)"
+				  << std::endl;
+		std::cout << "  > Sanitize Time : " << sanitize_time << " ms" << std::endl;
+
+		std::cout << "[STEP 3] Allocating Pinned Memory (DMA)..." << std::endl;
+		const auto t_alloc_start = std::chrono::high_resolution_clock::now();
+		const size_t num_blocks = (clean_size + 31) / 32;
 		PinnedHostBuffer<uint64_t> pinned_genome(num_blocks);
-		std::cout << "[CORE] Executing AVX2 Encoding (Direct to Pinned)..." << std::endl;
-		const auto start_enc = std::chrono::high_resolution_clock::now();
-		encode_sequence_avx2(data, size, pinned_genome.data());
-		const auto end_enc = std::chrono::high_resolution_clock::now();
-		const double enc_time_ms = std::chrono::duration_cast<std::chrono::microseconds>(end_enc - start_enc).count() / 1000.0;
-		const double throughput_gbps = (loader_d_size * 8.0 / 1e9) / (enc_time_ms / 1000.0);
+		const auto t_alloc_end = std::chrono::high_resolution_clock::now();
+		const double alloc_time = std::chrono::duration_cast<std::chrono::microseconds>(t_alloc_end - t_alloc_start).count() / 1000.0;
 
-		std::cout << "------------------------------------------------" << std::endl;
-		std::cout << "  Encoding Time : " << enc_time_ms << " ms" << std::endl;
-		std::cout << "  Throughput    : " << throughput_gbps << " Gb/s" << std::endl;
-		std::cout << "------------------------------------------------" << std::endl;
+		std::cout << "  > Buffer Size   : " << (pinned_genome.size() * 8.0 / 1024.0 / 1024.0) << " MB" << std::endl;
+		std::cout << "  > Alloc Time    : " << alloc_time << " ms" << std::endl;
+
+		std::cout << "[STEP 4] Executing AVX2 Encoding..." << std::endl;
+		const auto t_enc_start = std::chrono::high_resolution_clock::now();
+		encode_sequence_avx2(clean_data.data(), clean_size, pinned_genome.data());
+		const auto t_enc_end = std::chrono::high_resolution_clock::now();
+
+		const double enc_time = std::chrono::duration_cast<std::chrono::microseconds>(t_enc_end - t_enc_start).count() / 1000.0;
+		const double throughput = (clean_size * 8.0 / 1e9) / (enc_time / 1000.0);
+
+		std::cout << "  > Encoding Time : " << enc_time << " ms" << std::endl;
+		std::cout << "  > Throughput    : " << throughput << " Gb/s" << std::endl;
+
 		if (pinned_genome.size() > 0) {
-			const std::string signature = "ACGTACGTACGTACGTACGTAGGACGTACGT";
-			const uint64_t unique_pattern = make_pattern(signature);
-			pinned_genome[0] = unique_pattern;
-			std::cout << "\n[CORE] --- VALIDATION: PINNED MEMORY SEARCH ---" << std::endl;
-			std::cout << "Target (Index 0)     : ";
-			print_bits(unique_pattern);
-			std::cout << std::endl;
-			const uint64_t bulged_pattern = unique_pattern << 2;
-			SearchResults res = launch_bulge_search(pinned_genome.data(), pinned_genome.size(), bulged_pattern, 2, 0);
-			std::cout << "  Matches Found : " << res.count << std::endl;
-			std::cout << "  GPU Time      : " << res.time_ms << " ms" << std::endl;
-			if (res.count > 0 && res.matches[0] == 0) {
-				std::cout << "  [SUCCESS] TARGET LOCKED via DMA + PAM Validated." << std::endl;
-			} else {
-				std::cout << "  [FAIL] Target Missed (Check PAM logic)." << std::endl;
+			const std::vector targets = {target_seq, get_reverse_complement(target_seq)};
+			const std::vector<std::string> labels = {"FORWARD (+)", "REVERSE (-)"};
+
+			for (size_t t = 0; t < targets.size(); ++t) {
+				std::cout << "\n[STEP 5." << (t + 1) << "] Searching " << labels[t] << " Strand..." << std::endl;
+				std::cout << "  > Query         : " << targets[t] << std::endl;
+
+				const uint64_t pattern = make_pattern(targets[t]);
+				const uint64_t search_pattern = pattern;
+				SearchResults res = launch_bulge_search(pinned_genome.data(), pinned_genome.size(), search_pattern, 3, 0);
+				std::cout << "  > Matches Found : " << res.count << std::endl;
+				std::cout << "  > GPU Time      : " << res.time_ms << " ms" << std::endl;
+				if (res.count > 0) {
+					std::cout << "  > Top Hits:" << std::endl;
+					const uint32_t limit = (res.count < 5) ? res.count : 5;
+					for (uint32_t i = 0; i < limit; ++i) {
+						const uint32_t idx = res.matches[i];
+						std::cout << "    [" << i << "] Block " << idx << " (~" << static_cast<uint64_t>(idx) * 32 << " bp) : ";
+						print_bits(pinned_genome[idx]);
+						std::cout << std::endl;
+					}
+				}
+				free_search_results(res);
 			}
-			free_search_results(res);
 		}
+
+		const auto t_global_end = std::chrono::high_resolution_clock::now();
+		const double total_time = std::chrono::duration_cast<std::chrono::milliseconds>(t_global_end - t_global_start).count();
+		std::cout << "================================================================" << std::endl;
+		std::cout << "[CORE] Total Execution Time: " << total_time << " ms" << std::endl;
 	} catch (const std::exception &e) {
 		std::cerr << "[FATAL] " << e.what() << std::endl;
 		return 1;
