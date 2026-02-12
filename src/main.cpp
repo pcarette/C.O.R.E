@@ -77,18 +77,21 @@ int main(const int argc, char **argv) {
 		std::cout << "  Throughput    : " << throughput_gbps << " Gb/s" << std::endl;
 		std::cout << "------------------------------------------------" << std::endl;
 		if (pinned_genome.size() > 0) {
-			const std::string signature = "ACGTACGTACGTACGTACGTACGTACGTACGT";
+			const std::string signature = "ACGTACGTACGTACGTACGTAGGACGTACGT";
 			const uint64_t unique_pattern = make_pattern(signature);
 			pinned_genome[0] = unique_pattern;
 			std::cout << "\n[CORE] --- VALIDATION: PINNED MEMORY SEARCH ---" << std::endl;
+			std::cout << "Target (Index 0)     : ";
+			print_bits(unique_pattern);
+			std::cout << std::endl;
 			const uint64_t bulged_pattern = unique_pattern << 2;
 			SearchResults res = launch_bulge_search(pinned_genome.data(), pinned_genome.size(), bulged_pattern, 2);
 			std::cout << "  Matches Found : " << res.count << std::endl;
 			std::cout << "  GPU Time      : " << res.time_ms << " ms" << std::endl;
 			if (res.count > 0 && res.matches[0] == 0) {
-				std::cout << "  [SUCCESS] TARGET LOCKED via DMA." << std::endl;
+				std::cout << "  [SUCCESS] TARGET LOCKED via DMA + PAM Validated." << std::endl;
 			} else {
-				std::cout << "  [FAIL] Target Missed." << std::endl;
+				std::cout << "  [FAIL] Target Missed (Check PAM logic)." << std::endl;
 			}
 			free_search_results(res);
 		}

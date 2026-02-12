@@ -1,8 +1,13 @@
 #include <algorithm>
 #include <iostream>
+#include <vector>
 
 #include "gpu_utils.hpp"
 #include "kernel.hpp"
+
+__device__ __forceinline__ bool check_pam_cas9(uint64_t chunk, int bit_offset) {
+	return ((chunk >> (bit_offset + 2)) & 0xF) == 0xA;
+}
 
 __global__ void __launch_bounds__(256) k_search_exact(
 	const uint64_t *__restrict__ genome,
@@ -20,9 +25,11 @@ __global__ void __launch_bounds__(256) k_search_exact(
 	for (size_t i = idx; i < n; i += stride) {
 		uint64_t chunk = __ldg(&genome[i]);
 		if (__popcll(chunk ^ local_pattern) == 0) {
-			uint32_t write_idx = atomicAdd(match_count, 1);
-			if (write_idx < max_capacity) {
-				match_indices[write_idx] = (uint32_t)(global_offset + i);
+			if (check_pam_cas9(chunk, 40)) {
+				uint32_t write_idx = atomicAdd(match_count, 1);
+				if (write_idx < max_capacity) {
+					match_indices[write_idx] = (uint32_t)(global_offset + i);
+				}
 			}
 		}
 	}
@@ -43,20 +50,37 @@ __global__ void __launch_bounds__(256) k_search_bulge(
 	size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
 	size_t stride = blockDim.x * gridDim.x;
 	const uint64_t ODD_MASK = 0x5555555555555555ULL;
+
 	for (size_t i = idx; i < n; i += stride) {
 		uint64_t chunk = __ldg(&genome[i]);
+		// 1. Hamming Direct
+		// Alignement: C[0] == P[0]. Fin match: C[19]. PAM: C[20] (Offset 40).
 		uint64_t xor_d = chunk ^ local_pattern;
 		uint64_t diff_d = (xor_d | (xor_d >> 1)) & ODD_MASK;
 		int score_d = __popcll(diff_d);
+
+		// 2. Shift Left (Pattern << 2)
+		// Alignement: C[1] == P[0]. Fin match: C[20]. PAM: C[21] (Offset 42).
 		uint64_t pat_l = local_pattern << 2;
 		uint64_t xor_l = chunk ^ pat_l;
 		uint64_t diff_l = (xor_l | (xor_l >> 1)) & ODD_MASK;
 		int score_l = __popcll(diff_l);
+
+		// 3. Shift Right (Pattern >> 2) -- [CORRECTION ICI]
+		// Alignement: C[0] == P[1]. Fin match: C[19]. PAM: C[20] (Offset 40).
 		uint64_t pat_r = local_pattern >> 2;
 		uint64_t xor_r = chunk ^ pat_r;
 		uint64_t diff_r = (xor_r | (xor_r >> 1)) & ODD_MASK;
 		int score_r = __popcll(diff_r);
-		int best_score = min(score_d, min(score_l, score_r));
+
+		int best_score = max_mismatches + 1;
+		if (score_d <= max_mismatches && check_pam_cas9(chunk, 40))
+			best_score = min(best_score, score_d);
+		if (score_l <= max_mismatches && check_pam_cas9(chunk, 42))
+			best_score = min(best_score, score_l);
+		if (score_r <= max_mismatches && check_pam_cas9(chunk, 40))
+			best_score = min(best_score, score_r);
+
 		if (best_score <= max_mismatches) {
 			uint32_t write_idx = atomicAdd(match_count, 1);
 			if (write_idx < max_capacity) {
@@ -136,104 +160,109 @@ SearchResults launch_exact_search(const uint64_t *host_genome, size_t num_elemen
 }
 
 SearchResults launch_bulge_search(const uint64_t* host_genome, size_t num_elements, uint64_t pattern, int max_mismatches) {
-    SearchResults results;
-    results.count = 0;
-    results.capacity = 1024 * 1024;
-    results.matches = (uint32_t*)malloc(results.capacity * sizeof(uint32_t));
-    results.time_ms = 0.0f;
+	SearchResults results;
+	results.count = 0;
+	results.capacity = 1024 * 1024;
+	results.matches = (uint32_t*)malloc(results.capacity * sizeof(uint32_t));
+	results.time_ms = 0.0f;
 
-    CHECK_CUDA(cudaSetDevice(0));
+	CHECK_CUDA(cudaSetDevice(0));
 
-    const int N_STREAMS = 2;
-    size_t chunk_elements = 50 * 1024 * 1024;
+	const int N_STREAMS = 2;
+	size_t chunk_elements = 50 * 1024 * 1024;
 
-    std::cout << "[GPU] Pipeline: Double Buffering (2 Streams)" << std::endl;
+	std::cout << "[GPU] Pipeline: Double Buffering (2 Streams)" << std::endl;
 
-    std::vector<DeviceBuffer<uint64_t>*> d_genome;
-    std::vector<DeviceBuffer<uint32_t>*> d_indices;
-    std::vector<DeviceBuffer<uint32_t>*> d_count;
-    std::vector<CudaStream> streams(N_STREAMS);
+	std::vector<DeviceBuffer<uint64_t>*> d_genome;
+	std::vector<DeviceBuffer<uint32_t>*> d_indices;
+	std::vector<DeviceBuffer<uint32_t>*> d_count;
+	std::vector<CudaStream> streams(N_STREAMS);
 
-    PinnedHostBuffer<uint32_t> h_counts(N_STREAMS);
-    std::vector<uint32_t*> h_indices_pinned;
+	PinnedHostBuffer<uint32_t> h_counts(N_STREAMS);
+	std::vector<uint32_t *> h_indices_pinned;
 
-    for(int i=0; i<N_STREAMS; ++i) {
-        d_genome.push_back(new DeviceBuffer<uint64_t>(chunk_elements));
-        d_indices.push_back(new DeviceBuffer<uint32_t>(results.capacity / 4));
-        d_count.push_back(new DeviceBuffer<uint32_t>(1));
+	for(int i=0; i<N_STREAMS; ++i) {
+		d_genome.push_back(new DeviceBuffer<uint64_t>(chunk_elements));
+		d_indices.push_back(new DeviceBuffer<uint32_t>(results.capacity / 4));
+		d_count.push_back(new DeviceBuffer<uint32_t>(1));
 
-        uint32_t* pin_ptr;
-        CHECK_CUDA(cudaMallocHost(&pin_ptr, (results.capacity / 4) * sizeof(uint32_t)));
-        h_indices_pinned.push_back(pin_ptr);
+		uint32_t *pin_ptr;
+		CHECK_CUDA(cudaMallocHost(&pin_ptr, (results.capacity / 4) * sizeof(uint32_t)));
+		h_indices_pinned.push_back(pin_ptr);
     }
 
-    CudaEvent start, stop;
-    start.record();
+	CudaEvent start, stop;
+	start.record();
 
-    size_t processed = 0;
-    int batch_id = 0;
-    while (processed < num_elements) {
-        int sid = batch_id % N_STREAMS;
-        cudaStream_t stream = streams[sid].get();
-        if (batch_id >= N_STREAMS) {
-            streams[sid].synchronize();
-            uint32_t count = h_counts[sid];
-            if (count > 0) {
-                uint32_t to_copy = std::min(count, results.capacity - results.count);
-                if (to_copy > 0) {
-                    memcpy(results.matches + results.count, h_indices_pinned[sid], to_copy * sizeof(uint32_t));
-                    results.count += to_copy;
-                }
-            }
-        }
+	size_t processed = 0;
+	int batch_id = 0;
+	while (processed < num_elements) {
+		int sid = batch_id % N_STREAMS;
+		cudaStream_t stream = streams[sid].get();
+		if (batch_id >= N_STREAMS) {
+			streams[sid].synchronize();
+			uint32_t count = h_counts[sid];
+			if (count > 0) {
+				uint32_t to_copy = std::min(count, results.capacity - results.count);
+				if (to_copy > 0) {
+					memcpy(results.matches + results.count, h_indices_pinned[sid], to_copy * sizeof(uint32_t));
+					results.count += to_copy;
+				}
+			}
+		}
 
-        size_t current_batch = std::min(chunk_elements, num_elements - processed);
-        d_genome[sid]->copyFromHostAsync(host_genome + processed, current_batch, stream);
-        CHECK_CUDA(cudaMemsetAsync(d_count[sid]->data(), 0, sizeof(uint32_t), stream));
-        int threads = 256;
-        int blocks = (current_batch + threads - 1) / threads;
-        if (blocks > 32768) blocks = 32768;
-        k_search_bulge<<<blocks, threads, 0, stream>>>(
-             d_genome[sid]->data(), current_batch, pattern,
-             d_indices[sid]->data(), d_count[sid]->data(),
-             results.capacity / 4, processed, max_mismatches
-        );
-        d_count[sid]->copyToHostAsync(&h_counts[sid], 1, stream);
-        CHECK_CUDA(cudaMemcpyAsync(
-            h_indices_pinned[sid],
-            d_indices[sid]->data(),
-            (results.capacity / 4) * sizeof(uint32_t),
-            cudaMemcpyDeviceToHost,
-            stream
-        ));
-        processed += current_batch;
-        batch_id++;
+		size_t current_batch = std::min(chunk_elements, num_elements - processed);
+		d_genome[sid]->copyFromHostAsync(host_genome + processed, current_batch, stream);
+		CHECK_CUDA(cudaMemsetAsync(d_count[sid]->data(), 0, sizeof(uint32_t), stream));
+		int threads = 256;
+		int blocks = (current_batch + threads - 1) / threads;
+		if (blocks > 32768)
+			blocks = 32768;
+		k_search_bulge<<<blocks, threads, 0, stream>>>(
+			d_genome[sid]->data(),
+			current_batch,
+			pattern,
+			d_indices[sid]->data(),
+			d_count[sid]->data(),
+			results.capacity / 4,
+			processed,
+			max_mismatches
+		);
+		d_count[sid]->copyToHostAsync(&h_counts[sid], 1, stream);
+		CHECK_CUDA(cudaMemcpyAsync(
+			h_indices_pinned[sid],
+			d_indices[sid]->data(),
+			(results.capacity / 4) * sizeof(uint32_t),
+			cudaMemcpyDeviceToHost, stream)
+		);
+		processed += current_batch;
+		batch_id++;
     }
 
-    for (int i = 0; i < N_STREAMS; ++i) {
-        streams[i].synchronize();
-        uint32_t count = h_counts[i];
-        if (count > 0) {
-             uint32_t to_copy = std::min(count, results.capacity - results.count);
-             if (to_copy > 0) {
-                 memcpy(results.matches + results.count, h_indices_pinned[i], to_copy * sizeof(uint32_t));
-                 results.count += to_copy;
-             }
-        }
-    }
+	for (int i = 0; i < N_STREAMS; ++i) {
+		streams[i].synchronize();
+		uint32_t count = h_counts[i];
+		if (count > 0) {
+			uint32_t to_copy = std::min(count, results.capacity - results.count);
+			if (to_copy > 0) {
+				memcpy(results.matches + results.count, h_indices_pinned[i], to_copy * sizeof(uint32_t));
+				results.count += to_copy;
+			}
+		}
+	}
 
 	stop.record();
 	stop.synchronize();
 	results.time_ms = CudaEvent::elapsed(start, stop);
 
     for(int i=0; i<N_STREAMS; ++i) {
-        delete d_genome[i];
-        delete d_indices[i];
-        delete d_count[i];
-        cudaFreeHost(h_indices_pinned[i]);
-    }
+		delete d_genome[i];
+		delete d_indices[i];
+		delete d_count[i];
+		cudaFreeHost(h_indices_pinned[i]);
+	}
 
-    return results;
+	return results;
 }
 
 void free_search_results(SearchResults &results) {
