@@ -85,7 +85,7 @@ int main(const int argc, char **argv) {
 			print_bits(unique_pattern);
 			std::cout << std::endl;
 			const uint64_t bulged_pattern = unique_pattern << 2;
-			SearchResults res = launch_bulge_search(pinned_genome.data(), pinned_genome.size(), bulged_pattern, 2);
+			SearchResults res = launch_bulge_search(pinned_genome.data(), pinned_genome.size(), bulged_pattern, 2, 0);
 			std::cout << "  Matches Found : " << res.count << std::endl;
 			std::cout << "  GPU Time      : " << res.time_ms << " ms" << std::endl;
 			if (res.count > 0 && res.matches[0] == 0) {

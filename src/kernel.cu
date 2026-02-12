@@ -43,13 +43,15 @@ __global__ void __launch_bounds__(256) k_search_bulge(
 	uint32_t *__restrict__ match_count,
 	uint32_t max_capacity,
 	size_t global_offset,
-	int max_mismatches
+	int max_mismatches,
+	int max_seed_mismatches
 ) {
 	uint64_t local_pattern = pattern_val;
 	local_pattern = __shfl_sync(0xffffffff, local_pattern, 0);
 	size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
 	size_t stride = blockDim.x * gridDim.x;
 	const uint64_t ODD_MASK = 0x5555555555555555ULL;
+	const uint64_t SEED_MASK_BASE = 0xFFFFF00000ULL;
 
 	for (size_t i = idx; i < n; i += stride) {
 		uint64_t chunk = __ldg(&genome[i]);
@@ -57,29 +59,35 @@ __global__ void __launch_bounds__(256) k_search_bulge(
 		// Alignement: C[0] == P[0]. Fin match: C[19]. PAM: C[20] (Offset 40).
 		uint64_t xor_d = chunk ^ local_pattern;
 		uint64_t diff_d = (xor_d | (xor_d >> 1)) & ODD_MASK;
-		int score_d = __popcll(diff_d);
+
+        // Ponderation Seed
+        int seed_d = __popcll(diff_d & SEED_MASK_BASE);
+        int total_d = (seed_d > max_seed_mismatches) ? 999 : __popcll(diff_d);
 
 		// 2. Shift Left (Pattern << 2)
 		// Alignement: C[1] == P[0]. Fin match: C[20]. PAM: C[21] (Offset 42).
 		uint64_t pat_l = local_pattern << 2;
 		uint64_t xor_l = chunk ^ pat_l;
 		uint64_t diff_l = (xor_l | (xor_l >> 1)) & ODD_MASK;
-		int score_l = __popcll(diff_l);
 
 		// 3. Shift Right (Pattern >> 2) -- [CORRECTION ICI]
 		// Alignement: C[0] == P[1]. Fin match: C[19]. PAM: C[20] (Offset 40).
+		int seed_l = __popcll(diff_l & (SEED_MASK_BASE << 2));
+		int total_l = (seed_l > max_seed_mismatches) ? 999 : __popcll(diff_l);
 		uint64_t pat_r = local_pattern >> 2;
 		uint64_t xor_r = chunk ^ pat_r;
 		uint64_t diff_r = (xor_r | (xor_r >> 1)) & ODD_MASK;
-		int score_r = __popcll(diff_r);
+
+		int seed_r = __popcll(diff_r & (SEED_MASK_BASE >> 2));
+		int total_r = (seed_r > max_seed_mismatches) ? 999 : __popcll(diff_r);
 
 		int best_score = max_mismatches + 1;
-		if (score_d <= max_mismatches && check_pam_cas9(chunk, 40))
-			best_score = min(best_score, score_d);
-		if (score_l <= max_mismatches && check_pam_cas9(chunk, 42))
-			best_score = min(best_score, score_l);
-		if (score_r <= max_mismatches && check_pam_cas9(chunk, 40))
-			best_score = min(best_score, score_r);
+		if (total_d <= max_mismatches && check_pam_cas9(chunk, 40))
+			best_score = min(best_score, total_d);
+		if (total_l <= max_mismatches && check_pam_cas9(chunk, 42))
+			best_score = min(best_score, total_l);
+		if (total_r <= max_mismatches && check_pam_cas9(chunk, 40))
+			best_score = min(best_score, total_r);
 
 		if (best_score <= max_mismatches) {
 			uint32_t write_idx = atomicAdd(match_count, 1);
@@ -159,7 +167,13 @@ SearchResults launch_exact_search(const uint64_t *host_genome, size_t num_elemen
 	return results;
 }
 
-SearchResults launch_bulge_search(const uint64_t* host_genome, size_t num_elements, uint64_t pattern, int max_mismatches) {
+SearchResults launch_bulge_search(
+	const uint64_t* host_genome,
+	size_t num_elements,
+	uint64_t pattern,
+	int max_mismatches,
+	int max_seed_mismatches
+) {
 	SearchResults results;
 	results.count = 0;
 	results.capacity = 1024 * 1024;
@@ -226,7 +240,8 @@ SearchResults launch_bulge_search(const uint64_t* host_genome, size_t num_elemen
 			d_count[sid]->data(),
 			results.capacity / 4,
 			processed,
-			max_mismatches
+			max_mismatches,
+			max_seed_mismatches
 		);
 		d_count[sid]->copyToHostAsync(&h_counts[sid], 1, stream);
 		CHECK_CUDA(cudaMemcpyAsync(
