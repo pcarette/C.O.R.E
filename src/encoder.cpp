@@ -1,16 +1,48 @@
-#include <cstring>
+#include <cstdint>
 #include <immintrin.h>
 #include <omp.h>
 
 #include "encoder.hpp"
 
-alignas(32) static const __m256i SHUFFLE_LUT =
-	_mm256_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 3, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 3, 1, 0, 0, 0);
+alignas(32) static const __m256i SHUFFLE_LUT = _mm256_setr_epi8(
+	0x00,
+	0x00,
+	0x00,
+	0x40, // 0-3 (3=C)
+	0xC0,
+	0x00,
+	0x00,
+	0x80, // 4-7 (4=T, 7=G)
+	0x00,
+	0x00,
+	0x00,
+	0x00, // 8-11
+	0x00,
+	0x00,
+	0x00,
+	0x00, // 12-15 (14=N -> 00)
+	0x00,
+	0x00,
+	0x00,
+	0x40,
+	0xC0,
+	0x00,
+	0x00,
+	0x80,
+	0x00,
+	0x00,
+	0x00,
+	0x00,
+	0x00,
+	0x00,
+	0x00,
+	0x00
+);
 
-static constexpr uint64_t MASK_ODD = 0x5555555555555555ULL;
-static constexpr uint64_t MASK_EVEN = 0xAAAAAAAAAAAAAAAAULL;
+static constexpr uint64_t MASK_ODD_BITS = 0xAAAAAAAAAAAAAAAAULL;
+static constexpr uint64_t MASK_EVEN_BITS = 0x5555555555555555ULL;
 
-static __always_inline uint8_t encode_char_scalar(const char c) {
+static __always_inline uint8_t encode_char_scalar(const uint8_t c) {
 	switch (c & 0xDF) {
 	case 'C':
 		return 1;
@@ -25,9 +57,9 @@ static __always_inline uint8_t encode_char_scalar(const char c) {
 
 static __always_inline uint64_t process_block_32(const __m256i &raw) {
 	const __m256i vals = _mm256_shuffle_epi8(SHUFFLE_LUT, raw);
-	const auto mask0 = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_slli_epi16(vals, 7)));
-	const auto mask1 = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_slli_epi16(vals, 6)));
-	return _pdep_u64(mask0, MASK_ODD) | _pdep_u64(mask1, MASK_EVEN);
+	const auto mask_hi = static_cast<uint32_t>(_mm256_movemask_epi8(vals));
+	const auto mask_lo = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_slli_epi16(vals, 1)));
+	return _pdep_u64(mask_hi, MASK_ODD_BITS) | _pdep_u64(mask_lo, MASK_EVEN_BITS);
 }
 
 size_t encode_sequence_avx2(const uint8_t *__restrict__ data, const size_t size, uint64_t *__restrict__ output_buffer) {
@@ -54,10 +86,8 @@ size_t encode_sequence_avx2(const uint8_t *__restrict__ data, const size_t size,
 		const uint64_t v5 = process_block_32(r5);
 		const uint64_t v6 = process_block_32(r6);
 		const uint64_t v7 = process_block_32(r7);
-		const __m256i out_vec_a = _mm256_set_epi64x(v3, v2, v1, v0);
-		const __m256i out_vec_b = _mm256_set_epi64x(v7, v6, v5, v4);
-		_mm256_stream_si256(output_buffer + out_offset, out_vec_a);
-		_mm256_stream_si256(output_buffer + out_offset + 4, out_vec_b);
+		_mm256_stream_si256(output_buffer + out_offset, _mm256_set_epi64x(v3, v2, v1, v0));
+		_mm256_stream_si256(output_buffer + out_offset + 4, _mm256_set_epi64x(v7, v6, v5, v4));
 	}
 
 	size_t processed_bytes = chunks_256 * 256;
@@ -78,8 +108,15 @@ size_t encode_sequence_avx2(const uint8_t *__restrict__ data, const size_t size,
 			const uint8_t val = encode_char_scalar(data[k]);
 			current_block |= (static_cast<uint64_t>(val) << bit_pos);
 			bit_pos += 2;
+			if (bit_pos == 64) {
+				output_buffer[block_idx++] = current_block;
+				current_block = 0;
+				bit_pos = 0;
+			}
 		}
-		output_buffer[block_idx] = current_block;
+
+		if (bit_pos > 0)
+			output_buffer[block_idx] = current_block;
 	}
 
 	_mm_sfence();
