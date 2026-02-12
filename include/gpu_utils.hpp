@@ -5,13 +5,13 @@
 #include <stdexcept>
 #include <string>
 
-#define CHECK_CUDA(call)                                                                                               \
-	{                                                                                                                  \
-		cudaError_t err = call;                                                                                        \
-		if (err != cudaSuccess) {                                                                                      \
-			fprintf(stderr, "[GPU FATAL] CUDA Error at %s:%d -> %s\n", __FILE__, __LINE__, cudaGetErrorString(err));   \
-			exit(1);                                                                                                   \
-		}                                                                                                              \
+#define CHECK_CUDA(call)                                                                                                         \
+	{                                                                                                                            \
+		cudaError_t err = call;                                                                                                  \
+		if (err != cudaSuccess) {                                                                                                \
+			fprintf(stderr, "[GPU FATAL] CUDA Error at %s:%d -> %s\n", __FILE__, __LINE__, cudaGetErrorString(err));             \
+			exit(1);                                                                                                             \
+		}                                                                                                                        \
 	}
 
 template <typename T> class DeviceBuffer {
@@ -19,7 +19,7 @@ template <typename T> class DeviceBuffer {
 	size_t size_ = 0;
 
 public:
-	explicit DeviceBuffer(size_t size) : size_(size) {
+	explicit DeviceBuffer(const size_t size) : size_(size) {
 		if (size > 0) {
 			CHECK_CUDA(cudaMalloc(&ptr_, size * sizeof(T)));
 			CHECK_CUDA(cudaMemset(ptr_, 0, size * sizeof(T)));
@@ -39,24 +39,45 @@ public:
 		return ptr_;
 	}
 
-	size_t size() const {
+	[[nodiscard]] size_t size() const {
 		return size_;
 	}
 
-	size_t bytes() const {
-		return size_ * sizeof(T);
-	}
-
-	void copyFromHost(const T *host_ptr, size_t count) {
-		if (count > size_)
-			throw std::runtime_error("DeviceBuffer overflow");
+	void copyFromHost(const T *host_ptr, const size_t count) {
 		CHECK_CUDA(cudaMemcpy(ptr_, host_ptr, count * sizeof(T), cudaMemcpyHostToDevice));
 	}
 
-	void copyToHost(T *host_ptr, size_t count) {
-		if (count > size_)
-			throw std::runtime_error("DeviceBuffer underflow");
+	void copyToHost(T *host_ptr, const size_t count) {
 		CHECK_CUDA(cudaMemcpy(host_ptr, ptr_, count * sizeof(T), cudaMemcpyDeviceToHost));
+	}
+
+	void copyFromHostAsync(const T *host_ptr, const size_t count, const cudaStream_t stream) {
+		CHECK_CUDA(cudaMemcpyAsync(ptr_, host_ptr, count * sizeof(T), cudaMemcpyHostToDevice, stream));
+	}
+
+	void copyToHostAsync(T *host_ptr, const size_t count, const cudaStream_t stream) {
+		CHECK_CUDA(cudaMemcpyAsync(host_ptr, ptr_, count * sizeof(T), cudaMemcpyDeviceToHost, stream));
+	}
+};
+
+class CudaStream {
+	cudaStream_t stream_ = nullptr;
+
+public:
+	explicit CudaStream() {
+		CHECK_CUDA(cudaStreamCreate(&stream_));
+	}
+
+	~CudaStream() {
+		cudaStreamDestroy(stream_);
+	}
+
+	[[nodiscard]] cudaStream_t get() const {
+		return stream_;
+	}
+
+	void synchronize() const {
+		CHECK_CUDA(cudaStreamSynchronize(stream_));
 	}
 };
 
@@ -65,7 +86,7 @@ template <typename T> class PinnedHostBuffer {
 	size_t size_ = 0;
 
 public:
-	explicit PinnedHostBuffer(size_t size) : size_(size) {
+	explicit PinnedHostBuffer(const size_t size) : size_(size) {
 		if (size > 0)
 			CHECK_CUDA(cudaMallocHost(&ptr_, size * sizeof(T)));
 	}
@@ -75,15 +96,15 @@ public:
 			cudaFreeHost(ptr_);
 	}
 
-	PinnedHostBuffer(const PinnedHostBuffer&) = delete;
+	PinnedHostBuffer(const PinnedHostBuffer &) = delete;
 
-	PinnedHostBuffer& operator=(const PinnedHostBuffer&) = delete;
+	PinnedHostBuffer &operator=(const PinnedHostBuffer &) = delete;
 
 	T *data() const {
 		return ptr_;
 	}
 
-	size_t size() const {
+	[[nodiscard]] size_t size() const {
 		return size_;
 	}
 
@@ -97,10 +118,10 @@ public:
 };
 
 class CudaEvent {
-	cudaEvent_t event_;
+	cudaEvent_t event_ = nullptr;
 
 public:
-	CudaEvent() {
+	explicit CudaEvent() {
 		CHECK_CUDA(cudaEventCreate(&event_));
 	}
 
@@ -108,11 +129,11 @@ public:
 		cudaEventDestroy(event_);
 	}
 
-	void record(cudaStream_t stream = 0) {
+	void record(const cudaStream_t stream = nullptr) const {
 		CHECK_CUDA(cudaEventRecord(event_, stream));
 	}
 
-	void synchronize() {
+	void synchronize() const {
 		CHECK_CUDA(cudaEventSynchronize(event_));
 	}
 

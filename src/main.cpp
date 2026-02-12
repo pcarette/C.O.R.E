@@ -9,7 +9,7 @@
 #include "kernel.hpp"
 #include "loader.hpp"
 
-static volatile char sink;
+static volatile unsigned char sink;
 
 void print_bits(const uint64_t block) {
 	for (int i = 0; i < 32; ++i) {
@@ -29,8 +29,7 @@ uint64_t make_pattern(const std::string &seq) {
 	uint64_t pat = 0;
 	for (size_t i = 0; i < seq.length() && i < 32; ++i) {
 		uint64_t val = 0;
-		char c = seq[i];
-		if (c == 'C')
+		if (const char c = seq[i]; c == 'C')
 			val = 1;
 		else if (c == 'G')
 			val = 2;
@@ -53,7 +52,8 @@ int main(const int argc, char **argv) {
 
 	try {
 		const GenomeLoader loader(filepath);
-		std::cout << "[CORE] File mapped. Size: " << (loader.size() / 1024.0 / 1024.0) << " MB" << std::endl;
+		const auto loader_d_size = static_cast<double>(loader.size());
+		std::cout << "[CORE] File mapped. Size: " << (loader_d_size / 1024.0 / 1024.0) << " MB" << std::endl;
 		std::cout << "[CORE] Warming up RAM (Pre-faulting)..." << std::endl;
 
 		const uint8_t *data = loader.data();
@@ -62,26 +62,26 @@ int main(const int argc, char **argv) {
 		for (size_t i = 0; i < size; i += page_size)
 			sink = data[i];
 
+		std::cout << "[CORE] Allocating Pinned Memory (DMA Ready)..." << std::endl;
 		const size_t num_blocks = (size + 31) / 32;
-		std::cout << "[CORE] Allocating Pinned Memory (" << (num_blocks * 8.0 / 1024 / 1024) << " MB)..." << std::endl;
 		PinnedHostBuffer<uint64_t> pinned_genome(num_blocks);
 		std::cout << "[CORE] Executing AVX2 Encoding (Direct to Pinned)..." << std::endl;
 		const auto start_enc = std::chrono::high_resolution_clock::now();
 		encode_sequence_avx2(data, size, pinned_genome.data());
 		const auto end_enc = std::chrono::high_resolution_clock::now();
 		const double enc_time_ms = std::chrono::duration_cast<std::chrono::microseconds>(end_enc - start_enc).count() / 1000.0;
-		const double throughput_gbps = (size * 8.0 / 1e9) / (enc_time_ms / 1000.0);
+		const double throughput_gbps = (loader_d_size * 8.0 / 1e9) / (enc_time_ms / 1000.0);
 
 		std::cout << "------------------------------------------------" << std::endl;
 		std::cout << "  Encoding Time : " << enc_time_ms << " ms" << std::endl;
 		std::cout << "  Throughput    : " << throughput_gbps << " Gb/s" << std::endl;
 		std::cout << "------------------------------------------------" << std::endl;
 		if (pinned_genome.size() > 0) {
-			std::string signature = "ACGTACGTACGTACGTACGTACGTACGTACGT";
-			uint64_t unique_pattern = make_pattern(signature);
+			const std::string signature = "ACGTACGTACGTACGTACGTACGTACGTACGT";
+			const uint64_t unique_pattern = make_pattern(signature);
 			pinned_genome[0] = unique_pattern;
 			std::cout << "\n[CORE] --- VALIDATION: PINNED MEMORY SEARCH ---" << std::endl;
-			uint64_t bulged_pattern = unique_pattern << 2;
+			const uint64_t bulged_pattern = unique_pattern << 2;
 			SearchResults res = launch_bulge_search(pinned_genome.data(), pinned_genome.size(), bulged_pattern, 2);
 			std::cout << "  Matches Found : " << res.count << std::endl;
 			std::cout << "  GPU Time      : " << res.time_ms << " ms" << std::endl;
