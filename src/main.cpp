@@ -7,6 +7,8 @@
 #include <string>
 #include <vector>
 
+#include <immintrin.h>
+
 #include "encoder.hpp"
 #include "gpu_utils.hpp"
 #include "kernel.hpp"
@@ -34,9 +36,7 @@ uint64_t make_pattern(const std::string &seq) {
 	uint64_t pat = 0;
 	for (size_t i = 0; i < seq.size() && i < 32; ++i) {
 		uint8_t code = 0;
-		if (const char c = seq[i]; c == 'A' || c == 'a')
-			code = 0;
-		else if (c == 'C' || c == 'c')
+		if (const char c = seq[i]; c == 'C' || c == 'c')
 			code = 1;
 		else if (c == 'G' || c == 'g')
 			code = 2;
@@ -66,90 +66,73 @@ std::string get_reverse_complement(const std::string &seq) {
 	return rc;
 }
 
-void run_sanity_check() {
-	std::cout << "\n[DIAGNOSTICS] --- AVX2 MEMORY DUMP START ---" << std::endl;
-	std::string seq = "ACGTACGTACGTACGTACGTACGTACGTACGT";
-	const std::vector<uint8_t> raw(seq.begin(), seq.end());
-
-	PinnedHostBuffer<uint64_t> out(1);
-	encode_sequence_avx2(raw.data(), raw.size(), out.data());
-
-	uint64_t val = out[0];
-	std::cout << "Input    : " << seq.substr(0, 4) << "..." << std::endl;
-	std::cout << "Hex Raw  : 0x" << std::hex << val << std::dec << std::endl;
-	std::cout << "Bin Raw  : " << std::bitset<64>(val) << " (MSB ... LSB)" << std::endl;
-
-	std::cout << "Decoding LSB (Bytes Order Check):" << std::endl;
-	for (int i = 0; i < 4; i++) {
-		const uint8_t bits = (val >> (i * 2)) & 3;
-		const char c = seq[i];
-		std::cout << "  Base[" << i << "] '" << c << "' -> Bits: " << std::bitset<2>(bits) << " (" << static_cast<int>(bits)
-				  << ")" << std::endl;
-		bool ok = false;
-		if (c == 'A' && bits == 0)
-			ok = true;
-		if (c == 'C' && bits == 1)
-			ok = true;
-		if (c == 'G' && bits == 2)
-			ok = true;
-		if (c == 'T' && bits == 3)
-			ok = true;
-		if (!ok)
-			std::cout << "    [CRITICAL ERROR] Encoding Mismatch! CPU maps '" << c << "' to " << static_cast<int>(bits)
-					  << std::endl;
-		else
-			std::cout << "    [OK]" << std::endl;
-	}
-
-	std::string weird = "acgtNNNN";
-	while (weird.length() < 32)
-		weird += "A";
-
-	const std::vector<uint8_t> raw_weird(weird.begin(), weird.end());
-	encode_sequence_avx2(raw_weird.data(), raw_weird.size(), out.data());
-	val = out[0];
-
-	std::cout << "\nInput    : " << weird.substr(0, 8) << "..." << std::endl;
-	std::cout << "Hex Raw  : 0x" << std::hex << val << std::dec << std::endl;
-	std::cout << "Decoding :" << std::endl;
-	for (int i = 0; i < 8; i++) {
-		const uint8_t bits = (val >> (i * 2)) & 3;
-		const char c = weird[i];
-		std::cout << "  Base[" << i << "] '" << c << "' -> " << static_cast<int>(bits) << std::endl;
-	}
-
-	std::cout << "[DIAGNOSTICS] --- AVX2 MEMORY DUMP END ---\n" << std::endl;
-}
-
 std::vector<uint8_t> sanitize_genome(const uint8_t *raw_data, const size_t raw_size, double &duration_ms) {
 	const auto start = std::chrono::high_resolution_clock::now();
-	std::vector<uint8_t> clean_data;
-	clean_data.reserve(raw_size);
 
-	bool in_header = false;
-	for (size_t i = 0; i < raw_size; ++i) {
-		uint8_t c = raw_data[i];
-		if (in_header) {
-			if (c == '\n')
-				in_header = false;
+	std::vector<uint8_t> clean_data;
+	clean_data.resize(raw_size);
+
+	uint8_t *dst = clean_data.data();
+	const uint8_t *src = raw_data;
+	const uint8_t *end = raw_data + raw_size;
+	const __m256i thresh = _mm256_set1_epi8(32);
+	const __m256i gt_char = _mm256_set1_epi8('>');
+
+	while (src < end) {
+		if (*src == '>') {
+			if (const void *newline_pos = std::memchr(src, '\n', end - src))
+				src = static_cast<const uint8_t *>(newline_pos) + 1;
+			else
+				break;
 			continue;
 		}
-		if (c == '>') {
-			in_header = true;
-			continue;
+
+		while (src + 32 <= end) {
+			if (*src == '>')
+				break;
+
+			const __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(src));
+			const __m256i is_valid = _mm256_cmpgt_epi8(chunk, thresh);
+			const int mask = _mm256_movemask_epi8(is_valid);
+			const __m256i is_header = _mm256_cmpeq_epi8(chunk, gt_char);
+			const int header_mask = _mm256_movemask_epi8(is_header);
+			if (header_mask != 0)
+				break;
+
+			if (mask == -1) {
+				_mm256_storeu_si256(reinterpret_cast<__m256i *>(dst), chunk);
+				dst += 32;
+				src += 32;
+			} else {
+				const uint8_t *limit = src + 32;
+				while (src < limit) {
+					if (*src == '>')
+						break;
+					if (*src > 32) {
+						*dst++ = *src;
+					}
+					src++;
+				}
+			}
 		}
-		if (c == '\n' || c == '\r' || c == ' ' || c == '\t')
-			continue;
-		clean_data.push_back(c);
+
+		while (src < end && *src != '>') {
+			if (*src > 32) {
+				*dst++ = *src;
+			}
+			src++;
+		}
 	}
 
-	const auto end = std::chrono::high_resolution_clock::now();
-	duration_ms = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0;
+	const size_t actual_size = dst - clean_data.data();
+	clean_data.resize(actual_size);
+
+	const auto end_time = std::chrono::high_resolution_clock::now();
+	duration_ms = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start).count() / 1000.0;
 	return clean_data;
 }
 
 int main(const int argc, char **argv) {
-	run_sanity_check();
 	if (argc < 4) {
 		std::cerr << "Usage: ./core_runner <genome.fasta> <epigenome.epi> <TARGET_SEQUENCE>" << std::endl;
 		return 1;
@@ -236,7 +219,7 @@ int main(const int argc, char **argv) {
 				);
 				std::cout << "  > Matches Found : " << res.count << std::endl;
 				if (res.count > 0) {
-					const uint32_t limit = (res.count < 5) ? res.count : 5;
+					const uint32_t limit = (res.count < 15) ? res.count : 15;
 					for (uint32_t i = 0; i < limit; ++i) {
 						const uint32_t idx = res.matches[i] / 32;
 						std::cout << "    Hit Block " << idx << ": ";

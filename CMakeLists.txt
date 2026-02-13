@@ -68,6 +68,21 @@ endif ()
 add_executable(core_runner src/main.cpp)
 target_link_libraries(core_runner PRIVATE cuda_core core_logic CUDA::cudart)
 
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+	target_compile_options(core_runner PRIVATE
+			-O3
+			-march=native
+			-mtune=native
+			-mavx
+			-mavx2
+			-mfma
+			-mbmi2
+			-funroll-loops
+			-Wall -Wextra -Werror
+			-Wno-unused-parameter
+	)
+endif ()
+
 pybind11_add_module(core_engine src/python_bindings.cpp)
 target_link_libraries(core_engine PRIVATE cuda_core core_logic CUDA::cudart)
 
