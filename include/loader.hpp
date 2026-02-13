@@ -2,6 +2,15 @@
 
 #include <cstdint>
 #include <string_view>
+#include <vector>
+
+struct ChromosomeRange {
+	std::string name;
+	size_t start_idx{};
+};
+
+std::vector<uint8_t>
+sanitize_genome(const uint8_t *raw_data, size_t raw_size, std::vector<ChromosomeRange> &index, double &duration_ms);
 
 class GenomeLoader {
 	uint8_t *data_;

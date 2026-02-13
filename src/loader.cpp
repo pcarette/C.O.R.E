@@ -1,3 +1,5 @@
+#include <chrono>
+#include <cstring>
 #include <fcntl.h>
 #include <stdexcept>
 #include <string>
@@ -7,7 +9,86 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 
+#include <immintrin.h>
+
 #include "loader.hpp"
+
+std::vector<uint8_t>
+sanitize_genome(const uint8_t *raw_data, const size_t raw_size, std::vector<ChromosomeRange> &index, double &duration_ms) {
+	const auto start = std::chrono::high_resolution_clock::now();
+
+	std::vector<uint8_t> clean_data;
+	clean_data.resize(raw_size);
+
+	uint8_t *dst = clean_data.data();
+	const uint8_t *dst_start = clean_data.data();
+	const uint8_t *src = raw_data;
+	const uint8_t *end = raw_data + raw_size;
+
+	const __m256i thresh = _mm256_set1_epi8(32);
+	const __m256i gt_char = _mm256_set1_epi8('>');
+
+	while (src < end) {
+		if (*src == '>') {
+			const char *name_start = reinterpret_cast<const char *>(src) + 1;
+			const void *sep_space = std::memchr(name_start, ' ', end - src);
+			const void *sep_newline = std::memchr(name_start, '\n', end - src);
+			const char *name_end = reinterpret_cast<const char *>(end);
+			if (sep_space && sep_space < name_end)
+				name_end = static_cast<const char *>(sep_space);
+			if (sep_newline && sep_newline < name_end)
+				name_end = static_cast<const char *>(sep_newline);
+			const size_t current_offset = dst - dst_start;
+			index.push_back({std::string(name_start, name_end), current_offset});
+			if (const void *newline_pos = std::memchr(src, '\n', end - src))
+				src = static_cast<const uint8_t *>(newline_pos) + 1;
+			else
+				break;
+			continue;
+		}
+
+		while (src + 32 <= end) {
+			if (*src == '>')
+				break;
+
+			const __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(src));
+			const __m256i is_valid = _mm256_cmpgt_epi8(chunk, thresh);
+			const int mask = _mm256_movemask_epi8(is_valid);
+			const __m256i is_header = _mm256_cmpeq_epi8(chunk, gt_char);
+
+			if (const int header_mask = _mm256_movemask_epi8(is_header); header_mask != 0)
+				break;
+
+			if (mask == -1) {
+				_mm256_storeu_si256(reinterpret_cast<__m256i *>(dst), chunk);
+				dst += 32;
+				src += 32;
+			} else {
+				const uint8_t *limit = src + 32;
+				while (src < limit) {
+					if (*src == '>')
+						break;
+					if (*src > 32)
+						*dst++ = *src;
+					src++;
+				}
+			}
+		}
+
+		while (src < end && *src != '>') {
+			if (*src > 32)
+				*dst++ = *src;
+			src++;
+		}
+	}
+
+	const size_t actual_size = dst - clean_data.data();
+	clean_data.resize(actual_size);
+
+	const auto end_time = std::chrono::high_resolution_clock::now();
+	duration_ms = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start).count() / 1000.0;
+	return clean_data;
+}
 
 GenomeLoader::GenomeLoader(const std::string &filepath) : data_(nullptr), size_(0), fd_(-1) {
 	fd_ = open(filepath.c_str(), O_RDONLY);
@@ -36,8 +117,7 @@ GenomeLoader::~GenomeLoader() {
 }
 
 GenomeLoader::GenomeLoader(GenomeLoader &&other) noexcept
-	: data_(std::exchange(other.data_, nullptr)), size_(std::exchange(other.size_, 0)),
-	  fd_(std::exchange(other.fd_, -1)) {}
+	: data_(std::exchange(other.data_, nullptr)), size_(std::exchange(other.size_, 0)), fd_(std::exchange(other.fd_, -1)) {}
 
 GenomeLoader &GenomeLoader::operator=(GenomeLoader &&other) noexcept {
 	if (this != &other) {
