@@ -238,7 +238,7 @@ int main(const int argc, char **argv) {
 				if (res.count > 0) {
 					const uint32_t limit = (res.count < 5) ? res.count : 5;
 					for (uint32_t i = 0; i < limit; ++i) {
-						const uint32_t idx = res.matches[i];
+						const uint32_t idx = res.matches[i] / 32;
 						std::cout << "    Hit Block " << idx << ": ";
 						print_bits(pinned_genome[idx]);
 						std::cout << std::endl;
