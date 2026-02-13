@@ -70,9 +70,10 @@ __global__ void __launch_bounds__(256) k_search_bulge(
 			if (best_score <= max_mismatches) {
 				size_t local_byte_idx = i * 32 + offset;
 				uint8_t epi_val = epigenome[local_byte_idx];
-				bool is_accessible = (epi_val & MASK_ATAC);
+				//bool is_accessible = (epi_val & MASK_ATAC);
 				bool not_blacklisted = !(epi_val & MASK_BLACKLIST);
-				if (is_accessible && not_blacklisted) {
+				//if (is_accessible && not_blacklisted) {
+				if (not_blacklisted) {
 					uint32_t write_idx = atomicAdd(match_count, 1);
 					if (write_idx < max_capacity) {
 						size_t global_pos = (global_offset_blocks + i) * 32 + offset;
