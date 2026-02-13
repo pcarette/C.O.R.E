@@ -146,13 +146,14 @@ std::vector<uint8_t> sanitize_genome(const uint8_t *raw_data, const size_t raw_s
 
 int main(const int argc, char **argv) {
 	run_sanity_check();
-	if (argc < 3) {
-		std::cerr << "Usage: ./core_runner <file.fasta> <TARGET_SEQUENCE>" << std::endl;
+	if (argc < 4) {
+		std::cerr << "Usage: ./core_runner <genome.fasta> <epigenome.epi> <TARGET_SEQUENCE>" << std::endl;
 		return 1;
 	}
 
 	const std::string filepath = argv[1];
-	const std::string target_seq = argv[2];
+	const std::string epigenome_path = argv[2];
+	const std::string target_seq = argv[3];
 
 	if (target_seq.length() >= 23) {
 		const char pam1 = std::toupper(target_seq[21]);
@@ -185,7 +186,11 @@ int main(const int argc, char **argv) {
 		for (size_t i = 0; i < raw_size; i += 4096)
 			sink = raw_data[i];
 
-		std::cout << "[STEP 2] Sanitizing FASTA..." << std::endl;
+		std::cout << "[STEP 2] Loading Epigenome Atlas..." << std::endl;
+		const BinaryLoader epi_loader(epigenome_path);
+		std::cout << "  > Epigenome Size: " << (epi_loader.size() / 1024.0 / 1024.0) << "MB" << std::endl;
+
+		std::cout << "[STEP 3] Sanitizing FASTA..." << std::endl;
 		double sanitize_time = 0;
 		const std::vector<uint8_t> clean_data = sanitize_genome(raw_data, raw_size, sanitize_time);
 		const size_t clean_size = clean_data.size();
@@ -196,7 +201,7 @@ int main(const int argc, char **argv) {
 				  << std::endl;
 		std::cout << "  > Sanitize Time : " << sanitize_time << " ms" << std::endl;
 
-		std::cout << "[STEP 3] Allocating Pinned Memory (DMA)..." << std::endl;
+		std::cout << "[STEP 4] Allocating Pinned Memory (DMA)..." << std::endl;
 		const auto t_alloc_start = std::chrono::high_resolution_clock::now();
 		const size_t num_blocks = (clean_size + 31) / 32;
 		PinnedHostBuffer<uint64_t> pinned_genome(num_blocks);
@@ -207,7 +212,7 @@ int main(const int argc, char **argv) {
 		std::cout << "  > Buffer Size   : " << (pinned_genome.size() * 8.0 / 1024.0 / 1024.0) << " MB" << std::endl;
 		std::cout << "  > Alloc Time    : " << alloc_time << " ms" << std::endl;
 
-		std::cout << "[STEP 4] Executing AVX2 Encoding..." << std::endl;
+		std::cout << "[STEP 5] Executing AVX2 Encoding..." << std::endl;
 		const auto t_enc_start = std::chrono::high_resolution_clock::now();
 		encode_sequence_avx2(clean_data.data(), clean_size, pinned_genome.data());
 		const auto t_enc_end = std::chrono::high_resolution_clock::now();
@@ -219,10 +224,9 @@ int main(const int argc, char **argv) {
 		std::cout << "  > Throughput    : " << throughput << " Gb/s" << std::endl;
 
 		if (pinned_genome.size() > 0) {
-			const std::vector targets = {target_seq};
-			for (size_t t = 0; t < targets.size(); ++t) {
+			for (const std::vector targets = {target_seq}; const auto &target : targets) {
 				std::cout << "\n[STEP 5] Searching..." << std::endl;
-				const uint64_t pattern = make_pattern(targets[t]);
+				const uint64_t pattern = make_pattern(target);
 				SearchResults res = launch_bulge_search(pinned_genome.data(), pinned_genome.size(), pattern, 3, 0);
 				std::cout << "  > Matches Found : " << res.count << std::endl;
 				if (res.count > 0) {

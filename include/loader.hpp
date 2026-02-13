@@ -34,3 +34,26 @@ public:
 		return size_;
 	}
 };
+
+class BinaryLoader {
+	int m_fd_;
+	size_t m_size_;
+	uint8_t *m_data_;
+
+public:
+	explicit BinaryLoader(const std::string &filepath);
+
+	~BinaryLoader();
+
+	BinaryLoader(const BinaryLoader &) = delete;
+
+	BinaryLoader &operator=(const BinaryLoader &) = delete;
+
+	[[nodiscard]] const uint8_t *data() const {
+		return m_data_;
+	}
+
+	[[nodiscard]] size_t size() const {
+		return m_size_;
+	}
+};

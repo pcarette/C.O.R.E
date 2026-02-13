@@ -52,3 +52,31 @@ GenomeLoader &GenomeLoader::operator=(GenomeLoader &&other) noexcept {
 std::string_view GenomeLoader::get_view() const {
 	return {reinterpret_cast<const char *>(data_), size_};
 }
+
+BinaryLoader::BinaryLoader(const std::string &filepath) : m_fd_(-1), m_size_(0), m_data_(nullptr) {
+	m_fd_ = open(filepath.c_str(), O_RDONLY);
+	if (m_fd_ == -1)
+		throw std::runtime_error("BinaryLoader: Cannot open file " + filepath);
+
+	struct stat sb{};
+	if (fstat(m_fd_, &sb) == -1) {
+		close(m_fd_);
+		throw std::runtime_error("BinaryLoader: Cannot stat file " + filepath);
+	}
+
+	m_size_ = static_cast<size_t>(sb.st_size);
+	m_data_ = static_cast<uint8_t *>(mmap(nullptr, m_size_, PROT_READ, MAP_PRIVATE, m_fd_, 0));
+	if (m_data_ == MAP_FAILED) {
+		close(m_fd_);
+		throw std::runtime_error("BinaryLoader: mmap failed for " + filepath);
+	}
+
+	madvise(m_data_, m_size_, MADV_SEQUENTIAL);
+}
+
+BinaryLoader::~BinaryLoader() {
+	if (m_data_ && m_data_ != MAP_FAILED)
+		munmap(m_data_, m_size_);
+	if (m_fd_ != -1)
+		close(m_fd_);
+}
