@@ -32,15 +32,19 @@ void print_bits(const uint64_t block) {
 
 uint64_t make_pattern(const std::string &seq) {
 	uint64_t pat = 0;
-	for (size_t i = 0; i < seq.length() && i < 32; ++i) {
-		uint64_t val = 0;
-		if (const char c = std::toupper(seq[i]); c == 'C')
-			val = 1;
-		else if (c == 'G')
-			val = 2;
-		else if (c == 'T')
-			val = 3;
-		pat |= (val << (i * 2));
+	for (size_t i = 0; i < seq.size() && i < 32; ++i) {
+		uint8_t code = 0;
+		if (const char c = seq[i]; c == 'A' || c == 'a')
+			code = 0;
+		else if (c == 'C' || c == 'c')
+			code = 1;
+		else if (c == 'G' || c == 'g')
+			code = 2;
+		else if (c == 'T' || c == 't')
+			code = 3;
+		else
+			code = 0;
+		pat |= static_cast<uint64_t>(code) << (i * 2);
 	}
 	return pat;
 }
@@ -227,7 +231,9 @@ int main(const int argc, char **argv) {
 			for (const std::vector targets = {target_seq}; const auto &target : targets) {
 				std::cout << "\n[STEP 5] Searching..." << std::endl;
 				const uint64_t pattern = make_pattern(target);
-				SearchResults res = launch_bulge_search(pinned_genome.data(), pinned_genome.size(), pattern, 3, 0);
+				SearchResults res = launch_bulge_search(
+					pinned_genome.data(), epi_loader.data(), pinned_genome.size(), epi_loader.size(), pattern, 3, 0
+				);
 				std::cout << "  > Matches Found : " << res.count << std::endl;
 				if (res.count > 0) {
 					const uint32_t limit = (res.count < 5) ? res.count : 5;
