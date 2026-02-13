@@ -16,6 +16,11 @@
 
 static volatile uint8_t sink;
 
+struct ChromosomeRange {
+	std::string name;
+	size_t start_idx;
+};
+
 void print_bits(const uint64_t block) {
 	for (int i = 0; i < 32; ++i) {
 		const uint8_t val = (block >> (i * 2)) & 0x3;
@@ -51,8 +56,8 @@ uint64_t make_pattern(const std::string &seq) {
 
 std::string get_reverse_complement(const std::string &seq) {
 	std::string rc;
-	for (int i = seq.length() - 1; i >= 0; i--) {
-		if (const char c = std::toupper(seq[i]); c == 'A')
+	for (int i = static_cast<int>(seq.length()) - 1; i >= 0; i--) {
+		if (const uint8_t c = std::toupper(seq[i]); c == 'A')
 			rc += 'T';
 		else if (c == 'T')
 			rc += 'A';
@@ -66,20 +71,33 @@ std::string get_reverse_complement(const std::string &seq) {
 	return rc;
 }
 
-std::vector<uint8_t> sanitize_genome(const uint8_t *raw_data, const size_t raw_size, double &duration_ms) {
+std::vector<uint8_t>
+sanitize_genome(const uint8_t *raw_data, const size_t raw_size, std::vector<ChromosomeRange> &index, double &duration_ms) {
 	const auto start = std::chrono::high_resolution_clock::now();
 
 	std::vector<uint8_t> clean_data;
 	clean_data.resize(raw_size);
 
 	uint8_t *dst = clean_data.data();
+	const uint8_t *dst_start = clean_data.data();
 	const uint8_t *src = raw_data;
 	const uint8_t *end = raw_data + raw_size;
+
 	const __m256i thresh = _mm256_set1_epi8(32);
 	const __m256i gt_char = _mm256_set1_epi8('>');
 
 	while (src < end) {
 		if (*src == '>') {
+			const char *name_start = reinterpret_cast<const char *>(src) + 1;
+			const void *sep_space = std::memchr(name_start, ' ', end - src);
+			const void *sep_newline = std::memchr(name_start, '\n', end - src);
+			const char *name_end = reinterpret_cast<const char *>(end);
+			if (sep_space && sep_space < name_end)
+				name_end = static_cast<const char *>(sep_space);
+			if (sep_newline && sep_newline < name_end)
+				name_end = static_cast<const char *>(sep_newline);
+			const size_t current_offset = dst - dst_start;
+			index.push_back({std::string(name_start, name_end), current_offset});
 			if (const void *newline_pos = std::memchr(src, '\n', end - src))
 				src = static_cast<const uint8_t *>(newline_pos) + 1;
 			else
@@ -95,8 +113,8 @@ std::vector<uint8_t> sanitize_genome(const uint8_t *raw_data, const size_t raw_s
 			const __m256i is_valid = _mm256_cmpgt_epi8(chunk, thresh);
 			const int mask = _mm256_movemask_epi8(is_valid);
 			const __m256i is_header = _mm256_cmpeq_epi8(chunk, gt_char);
-			const int header_mask = _mm256_movemask_epi8(is_header);
-			if (header_mask != 0)
+
+			if (const int header_mask = _mm256_movemask_epi8(is_header); header_mask != 0)
 				break;
 
 			if (mask == -1) {
@@ -108,18 +126,16 @@ std::vector<uint8_t> sanitize_genome(const uint8_t *raw_data, const size_t raw_s
 				while (src < limit) {
 					if (*src == '>')
 						break;
-					if (*src > 32) {
+					if (*src > 32)
 						*dst++ = *src;
-					}
 					src++;
 				}
 			}
 		}
 
 		while (src < end && *src != '>') {
-			if (*src > 32) {
+			if (*src > 32)
 				*dst++ = *src;
-			}
 			src++;
 		}
 	}
@@ -130,6 +146,21 @@ std::vector<uint8_t> sanitize_genome(const uint8_t *raw_data, const size_t raw_s
 	const auto end_time = std::chrono::high_resolution_clock::now();
 	duration_ms = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start).count() / 1000.0;
 	return clean_data;
+}
+
+void print_genomic_location(const uint64_t block_idx, const std::vector<ChromosomeRange> &index) {
+	const size_t global_base_pos = block_idx * 32;
+	auto it = std::upper_bound(index.begin(), index.end(), global_base_pos, [](size_t pos, const ChromosomeRange &range) {
+		return pos < range.start_idx;
+	});
+
+	if (it != index.begin()) {
+		--it;
+		const size_t relative_offset = global_base_pos - it->start_idx;
+		std::cout << "    Position: " << it->name << ":" << (relative_offset + 1);
+	} else {
+		std::cout << "    Position: Unknown: " << global_base_pos;
+	}
 }
 
 int main(const int argc, char **argv) {
@@ -143,8 +174,8 @@ int main(const int argc, char **argv) {
 	const std::string target_seq = argv[3];
 
 	if (target_seq.length() >= 23) {
-		const char pam1 = std::toupper(target_seq[21]);
-		if (const char pam2 = std::toupper(target_seq[22]); pam1 != 'G' || pam2 != 'G') {
+		const auto pam1 = static_cast<uint8_t>(std::toupper(target_seq[21]));
+		if (const auto pam2 = static_cast<uint8_t>(std::toupper(target_seq[22])); pam1 != 'G' || pam2 != 'G') {
 			std::cout << "[WARN] Target does not end with 'GG' (PAM). Kernel filter will likely reject it." << std::endl;
 		}
 	}
@@ -164,8 +195,8 @@ int main(const int argc, char **argv) {
 		const double load_time =
 			std::chrono::duration_cast<std::chrono::microseconds>(t_load_end - t_load_start).count() / 1000.0;
 
-		std::cout << "  > Mapped Size   : " << std::fixed << std::setprecision(2) << (loader.size() / 1024.0 / 1024.0) << " MB"
-				  << std::endl;
+		std::cout << "  > Mapped Size   : " << std::fixed << std::setprecision(2)
+				  << (static_cast<double>(loader.size()) / 1024.0 / 1024.0) << " MB" << std::endl;
 		std::cout << "  > IO Time       : " << load_time << " ms" << std::endl;
 
 		const uint8_t *raw_data = loader.data();
@@ -175,17 +206,18 @@ int main(const int argc, char **argv) {
 
 		std::cout << "[STEP 2] Loading Epigenome Atlas..." << std::endl;
 		const BinaryLoader epi_loader(epigenome_path);
-		std::cout << "  > Epigenome Size: " << (epi_loader.size() / 1024.0 / 1024.0) << "MB" << std::endl;
+		std::cout << "  > Epigenome Size: " << (static_cast<double>(epi_loader.size()) / 1024.0 / 1024.0) << "MB" << std::endl;
 
 		std::cout << "[STEP 3] Sanitizing FASTA..." << std::endl;
 		double sanitize_time = 0;
-		const std::vector<uint8_t> clean_data = sanitize_genome(raw_data, raw_size, sanitize_time);
+		std::vector<ChromosomeRange> chr_index;
+		const std::vector<uint8_t> clean_data = sanitize_genome(raw_data, raw_size, chr_index, sanitize_time);
 		const size_t clean_size = clean_data.size();
 
-		const double ratio = static_cast<double>(clean_size) / raw_size * 100.0;
-		std::cout << "  > Raw Size      : " << (raw_size / 1024.0 / 1024.0) << " MB" << std::endl;
-		std::cout << "  > Clean Size    : " << (clean_size / 1024.0 / 1024.0) << " MB (" << ratio << "% genetic content)"
-				  << std::endl;
+		const double ratio = static_cast<double>(clean_size) / static_cast<double>(raw_size) * 100.0;
+		std::cout << "  > Raw Size      : " << (static_cast<double>(raw_size) / 1024.0 / 1024.0) << " MB" << std::endl;
+		std::cout << "  > Clean Size    : " << (static_cast<double>(clean_size) / 1024.0 / 1024.0) << " MB (" << ratio
+				  << "% genetic content)" << std::endl;
 		std::cout << "  > Sanitize Time : " << sanitize_time << " ms" << std::endl;
 
 		std::cout << "[STEP 4] Allocating Pinned Memory (DMA)..." << std::endl;
@@ -196,7 +228,8 @@ int main(const int argc, char **argv) {
 		const double alloc_time =
 			std::chrono::duration_cast<std::chrono::microseconds>(t_alloc_end - t_alloc_start).count() / 1000.0;
 
-		std::cout << "  > Buffer Size   : " << (pinned_genome.size() * 8.0 / 1024.0 / 1024.0) << " MB" << std::endl;
+		std::cout << "  > Buffer Size   : " << (static_cast<double>(pinned_genome.size()) * 8.0 / 1024.0 / 1024.0) << " MB"
+				  << std::endl;
 		std::cout << "  > Alloc Time    : " << alloc_time << " ms" << std::endl;
 
 		std::cout << "[STEP 5] Executing AVX2 Encoding..." << std::endl;
@@ -205,7 +238,7 @@ int main(const int argc, char **argv) {
 		const auto t_enc_end = std::chrono::high_resolution_clock::now();
 
 		const double enc_time = std::chrono::duration_cast<std::chrono::microseconds>(t_enc_end - t_enc_start).count() / 1000.0;
-		const double throughput = (clean_size * 8.0 / 1e9) / (enc_time / 1000.0);
+		const double throughput = (static_cast<double>(clean_size) * 8.0 / 1e9) / (enc_time / 1000.0);
 
 		std::cout << "  > Encoding Time : " << enc_time << " ms" << std::endl;
 		std::cout << "  > Throughput    : " << throughput << " Gb/s" << std::endl;
@@ -224,6 +257,7 @@ int main(const int argc, char **argv) {
 						const uint32_t idx = res.matches[i] / 32;
 						std::cout << "    Hit Block " << idx << ": ";
 						print_bits(pinned_genome[idx]);
+						print_genomic_location(idx, chr_index);
 						std::cout << std::endl;
 					}
 				}
