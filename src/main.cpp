@@ -1,3 +1,5 @@
+#include "config.hpp"
+
 #include <algorithm>
 #include <cstring>
 #include <iomanip>
@@ -177,13 +179,22 @@ void run_search_pass(
 
 int main(const int argc, char **argv) {
 	if (argc < 4) {
-		std::cerr << "Usage: " << argv[0] << " <fasta_file> <epi_file> <sequence>" << std::endl;
+		std::cerr << "Usage: " << argv[0] << " <fasta_file> <epi_file> <sequence> <config.json>" << std::endl;
 		return 1;
 	}
 
 	const std::string fasta_path = argv[1];
 	const std::string epi_path = argv[2];
 	const std::string query_seq = argv[3];
+	const std::string config_path = argv[4];
+	EnzymeConfig enzyme_config;
+	try {
+		enzyme_config = ConfigLoader::load_from_json(config_path);
+	} catch (const std::exception& e) {
+		std::cerr << "[ERROR] Config loading failed: " << e.what() << std::endl;
+		return 1;
+	}
+	std::cout << &enzyme_config << std::endl;
 
 	if (query_seq.length() < 23) {
 		std::cerr << "[ERROR] Sequence must be at least 23bp (20bp Spacer + 3bp PAM)" << std::endl;
