@@ -7,7 +7,7 @@ from pybiomart import Server
 
 CORE_BINARY = "./cmake-build-release/core_runner"
 DATA_FASTA = "./data/hg38_full.fa"
-DATA_EPI = "./data/hg38_k562.epi"
+DATA_EPI = "./data/hg38_hek293.epi"
 
 
 def get_gene_info(coordinates):
