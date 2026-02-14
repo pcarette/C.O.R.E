@@ -27,6 +27,22 @@ uint64_t encode_pattern_python(const std::string &seq) {
 	return pat;
 }
 
+std::string decode_2bit(const uint64_t block) {
+	std::string s;
+	s.reserve(32);
+	for (int i = 0; i < 32; ++i) {
+		if (const uint8_t val = (block >> (i * 2)) & 0x3; val == 0)
+			s += 'A';
+		else if (val == 1)
+			s += 'C';
+		else if (val == 2)
+			s += 'G';
+		else
+			s += 'T';
+	}
+	return s;
+}
+
 class CoreEngine {
 	std::unique_ptr<PinnedHostBuffer<uint64_t>> pinned_genome_;
 	std::unique_ptr<BinaryLoader> epi_loader_;
@@ -47,18 +63,18 @@ public:
 		encode_sequence_avx2(clean_data.data(), clean_data.size(), pinned_genome_->data());
 	}
 
-	py::array_t<uint32_t> search(const std::string &pattern_seq, int max_mismatches = 3) {
+	py::array_t<uint32_t> search(const std::string &pattern_seq, const int max_mismatches = 3) {
 		if (pattern_seq.length() > 32) {
 			throw std::runtime_error("Pattern length must be <= 32bp");
 		}
 
-		uint64_t pattern = encode_pattern_python(pattern_seq);
+		const uint64_t pattern = encode_pattern_python(pattern_seq);
 		SearchResults results = launch_bulge_search(
 			pinned_genome_->data(), epi_loader_->data(), pinned_genome_->size(), epi_loader_->size(), pattern, max_mismatches, 0
 		);
 		auto result_array = py::array_t<uint32_t>(results.count);
 		if (results.count > 0) {
-			py::buffer_info buffer = result_array.request();
+			const py::buffer_info buffer = result_array.request();
 			uint32_t *ptr = static_cast<uint32_t *>(buffer.ptr);
 			std::memcpy(ptr, results.matches, results.count * sizeof(uint32_t));
 		}
@@ -67,20 +83,25 @@ public:
 		return result_array;
 	}
 
-	std::string resolve_location(uint32_t block_idx) {
-		size_t global_base_pos = static_cast<size_t>(block_idx) * 32;
-		auto it =
-			std::upper_bound(chr_index_.begin(), chr_index_.end(), global_base_pos, [](size_t pos, const ChromosomeRange &range) {
+	std::pair<std::string, std::string> resolve_location(const uint32_t base_idx) {
+		const size_t global_base_pos = base_idx;
+		const auto it = std::upper_bound(
+			chr_index_.begin(), chr_index_.end(), global_base_pos, [](const size_t pos, const ChromosomeRange &range) {
 				return pos < range.start_idx;
-			});
+			}
+		);
 
+		std::string loc = "Unknown";
 		if (it != chr_index_.begin()) {
-			--it;
-			const size_t offset = global_base_pos - it->start_idx;
-			return it->name + ":" + std::to_string(offset + 1);
+			const auto prev = std::prev(it);
+			loc = prev->name + ":" + std::to_string(global_base_pos - prev->start_idx + 1);
 		}
 
-		return "Unknown: " + std::to_string(global_base_pos);
+		const uint32_t block_idx = base_idx / 32;
+		if (block_idx >= pinned_genome_->size())
+			return {loc, "ERROR_OUT_OF_BOUNDS"};
+
+		return {loc, decode_2bit((*pinned_genome_)[block_idx])};
 	}
 
 	size_t get_genome_size_blocks() const {
