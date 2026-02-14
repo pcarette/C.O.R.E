@@ -30,3 +30,4 @@ out/
 *.iws
 data/
 Pipfile.lock
+*.sqlite
