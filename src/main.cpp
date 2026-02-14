@@ -52,7 +52,7 @@ uint64_t encode_dna_string(const std::string &seq) {
 	return pattern_enc;
 }
 
-uint64_t generate_care_mask(size_t len, bool is_forward) {
+uint64_t generate_care_mask(const size_t len, const bool is_forward) {
 	uint64_t mask = 0;
 	for (size_t i = 0; i < len; ++i) {
 		bool care = true;
@@ -75,12 +75,13 @@ uint64_t generate_care_mask(size_t len, bool is_forward) {
 void run_search_pass(
 	const std::string &label,
 	const std::string &query,
-	bool is_forward,
+	const bool is_forward,
 	const PinnedHostBuffer<uint64_t> &genome_buf,
 	const std::vector<ChromosomeRange> &chr_index
 ) {
-	uint64_t pattern = encode_dna_string(query);
-	uint64_t mask = generate_care_mask(query.length(), is_forward);
+	const uint64_t pattern = encode_dna_string(query);
+	const uint64_t mask = generate_care_mask(query.length(), is_forward);
+
 	SearchResults results = launch_bulge_search(genome_buf.data(), nullptr, genome_buf.size(), 0, pattern, mask, 3, 0);
 
 	for (size_t i = 0; i < results.count; ++i) {
@@ -99,22 +100,38 @@ void run_search_pass(
 
 		int best_mm = 999;
 		int best_offset = -1;
-		std::string matched_seq = "";
+		std::string matched_seq;
 
 		for (int off = 0; off < 32; ++off) {
 			std::string sub = raw_block.substr(off, 23);
 			if (sub.length() < 23)
 				break;
 
-			int mm = 0;
-			for (int k = 0; k < 23; ++k) {
-				if (is_forward && k == 20)
-					continue;
-				if (!is_forward && k == 2)
-					continue;
+			bool pam_ok = false;
+			if (is_forward) {
+				if (sub[21] == query[21] && sub[22] == query[22]) {
+					pam_ok = true;
+				}
+			} else {
+				if (sub[0] == query[0] && sub[1] == query[1]) {
+					pam_ok = true;
+				}
+			}
 
-				if (sub[k] != query[k])
-					mm++;
+			if (!pam_ok)
+				continue;
+
+			int mm = 0;
+			if (is_forward) {
+				for (int k = 0; k < 20; ++k) {
+					if (sub[k] != query[k])
+						mm++;
+				}
+			} else {
+				for (int k = 3; k < 23; ++k) {
+					if (sub[k] != query[k])
+						mm++;
+				}
 			}
 
 			if (mm <= 3) {
@@ -135,7 +152,6 @@ void run_search_pass(
 				return pos < range.start_idx;
 			}
 		);
-
 		std::string loc = "Unknown";
 		if (it != chr_index.begin()) {
 			const auto prev = std::prev(it);
@@ -166,11 +182,11 @@ int main(const int argc, char **argv) {
 		double t;
 		const std::vector<uint8_t> clean_data = sanitize_genome(fasta_path, loader.data(), loader.size(), chr_index, t);
 		size_t num_blocks = (clean_data.size() + 31) / 32;
-		auto pinned_genome = std::make_unique<PinnedHostBuffer<uint64_t>>(num_blocks);
+		const auto pinned_genome = std::make_unique<PinnedHostBuffer<uint64_t>>(num_blocks);
 		encode_sequence_avx2(clean_data.data(), clean_data.size(), pinned_genome->data());
 		std::cout << "----------------------------------------------------------------" << std::endl;
 		run_search_pass("(+)", query_seq, true, *pinned_genome, chr_index);
-		std::string rc_query = reverse_complement(query_seq);
+		const std::string rc_query = reverse_complement(query_seq);
 		run_search_pass("(-)", rc_query, false, *pinned_genome, chr_index);
 		std::cout << "----------------------------------------------------------------" << std::endl;
 	} catch (const std::exception &e) {
