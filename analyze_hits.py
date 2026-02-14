@@ -1,3 +1,4 @@
+import json
 import numpy as np
 from openai import OpenAI
 import os
@@ -18,29 +19,50 @@ client = OpenAI(
     base_url="https://integrate.api.nvidia.com/v1",
     api_key=os.environ.get("NVIDIA_API_KEY")
 )
-MODEL_NAME = "meta/llama-3.1-70b-instruct"
+MODEL_NAME = "nvidia/llama-3.3-nemotron-super-49b-v1.5"
+
 
 def analyze_batch(hits_data):
-    prompt_content = "Here is a list of potential off-target sequences detected by CRISPR:\n"
+    sequences_list = []
     for i, (hid, loc, seq) in enumerate(hits_data):
-        prompt_content += f"{i + 1}. SEQ: {seq}, LOC: {loc}\n"
+        sequences_list.append({"id": int(hid), "location": str(loc), "sequence": str(seq)})
 
-    prompt_content += ("For each sequence, indicate whether it falls within a known coding region (Gene) and "
-                       "estimate the clinical risk (High/Medium/Low) based on the location.\n")
+    data_str = json.dumps(sequences_list, indent=2)
+
+    system_prompt = (
+        "You are a bioinformatics assistant specialized in CRISPR off-target risk assessment. "
+        "Your task is to annotate genomic coordinates (hg38 assembly, cell line K562). "
+        "Return ONLY a valid JSON object."
+    )
+
+    user_prompt = f"""
+    Analyze the following list of potential off-target sites:
+    {data_str}
+
+    For each site:
+    1. Identify the nearest Gene (Symbol). If intergenic, note 'Intergenic'.
+    2. Determine the Genomic Region (Exon, Intron, Promoter, Enhancer).
+    3. Infer Chromatin Accessibility based on the region (e.g., Promoters are usually 'Open', Heterochromatin is 'Closed').
+    4. Assign a 'Clinical_Risk' (High/Medium/Low).
+       - High: Coding exon or critical promoter.
+       - Medium: Intron or regulatory region.
+       - Low: Intergenic/Closed chromatin.
+
+    Output format must be a JSON object with a key "analysis" containing the list of results.
+    NO explanations, NO internal monologue, ONLY JSON.
+    """
 
     try:
         completion = client.chat.completions.create(model=MODEL_NAME, messages=[
             {
                 "role": "system",
-                "content": "You are an expert in genome editing. Analyze the sequences provided. "
-                           "Estimate the risk of clinical off-target effects based on the probable genomic "
-                           "location and chromatin accessibility. Be concise."
+                "content": system_prompt
             },
             {
                 "role": "user",
-                "content": prompt_content
+                "content": user_prompt
             }
-        ], temperature=0.2, max_tokens=1024)
+        ], temperature=0.2, max_tokens=2048, extra_body={"response_format": {"type": "json_object"}})
         return completion.choices[0].message.content
     except Exception as e:
         return f"[ERROR] NIM Call failed: {e}"
