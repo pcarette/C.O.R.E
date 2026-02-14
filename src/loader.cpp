@@ -9,11 +9,10 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 #include "loader.hpp"
-
-#include <utility>
 
 namespace fs = std::filesystem;
 
@@ -27,11 +26,11 @@ void save_cache(const std::string &base_path, const std::vector<uint8_t> &data, 
 	std::ofstream out_idx(idx_path, std::ios::binary);
 	size_t count = index.size();
 	out_idx.write(reinterpret_cast<const char *>(&count), sizeof(count));
-	for (const auto &chr : index) {
-		size_t name_len = chr.name.size();
+	for (const auto &[name, start_idx] : index) {
+		size_t name_len = name.size();
 		out_idx.write(reinterpret_cast<const char *>(&name_len), sizeof(name_len));
-		out_idx.write(chr.name.data(), name_len);
-		out_idx.write(reinterpret_cast<const char *>(&chr.start_idx), sizeof(chr.start_idx));
+		out_idx.write(name.data(), name_len);
+		out_idx.write(reinterpret_cast<const char *>(&start_idx), sizeof(start_idx));
 	}
 }
 
@@ -66,8 +65,9 @@ bool load_cache(const std::string &base_path, std::vector<uint8_t> &data, std::v
 std::vector<uint8_t> sanitize_genome(
 	const std::string &filepath,
 	const uint8_t *raw_data,
-	size_t raw_size,
+	const size_t raw_size,
 	std::vector<ChromosomeRange> &index,
+	std::vector<bool> &n_mask,
 	double &duration_ms
 ) {
 	const auto start = std::chrono::high_resolution_clock::now();
@@ -80,8 +80,8 @@ std::vector<uint8_t> sanitize_genome(
 	}
 
 	std::cout << "[LOADER] Sanitizing Genome (Removing Ns, Adding Padding)..." << std::endl;
-
 	clean_data.reserve(raw_size / 2);
+	n_mask.reserve(raw_size / 2);
 
 	const uint8_t *src = raw_data;
 	const uint8_t *end = raw_data + raw_size;
@@ -89,8 +89,10 @@ std::vector<uint8_t> sanitize_genome(
 	while (src < end) {
 		if (*src == '>') {
 			if (!clean_data.empty()) {
-				for (size_t p = 0; p < CHROM_PADDING_BYTES; ++p)
+				for (size_t p = 0; p < CHROM_PADDING_BYTES; ++p) {
 					clean_data.push_back(0);
+					n_mask.push_back(false);
+				}
 			}
 
 			const char *name_start = reinterpret_cast<const char *>(src) + 1;
@@ -99,7 +101,7 @@ std::vector<uint8_t> sanitize_genome(
 				name_end++;
 			}
 
-			size_t current_idx_bases = clean_data.size();
+			const size_t current_idx_bases = clean_data.size();
 			index.push_back({std::string(name_start, name_end), current_idx_bases});
 			src = static_cast<const uint8_t *>(std::memchr(src, '\n', end - src));
 			if (src)
@@ -112,6 +114,7 @@ std::vector<uint8_t> sanitize_genome(
 		while (src < end && *src != '>') {
 			if (uint8_t c = *src; c != '\n' && c != '\r') {
 				uint8_t val = 0;
+				bool is_n = false;
 				c = c & 0xDF;
 				if (c == 'C')
 					val = 1;
@@ -119,8 +122,11 @@ std::vector<uint8_t> sanitize_genome(
 					val = 2;
 				else if (c == 'T')
 					val = 3;
+				else if (c != 'A')
+					is_n = true;
 
 				clean_data.push_back(val);
+				n_mask.push_back(is_n);
 			}
 			src++;
 		}

@@ -12,8 +12,9 @@ struct ChromosomeRange {
 std::vector<uint8_t> sanitize_genome(
 	const std::string &filepath,
 	const uint8_t *raw_data,
-	const size_t raw_size,
+	size_t raw_size,
 	std::vector<ChromosomeRange> &index,
+	std::vector<bool> &n_mask,
 	double &duration_ms
 );
 

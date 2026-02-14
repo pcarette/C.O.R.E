@@ -1,3 +1,4 @@
+/*
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -150,3 +151,4 @@ PYBIND11_MODULE(core_engine, m) {
 		)
 		.def_property_readonly("total_blocks", &CoreEngine::get_genome_size_blocks);
 }
+*/

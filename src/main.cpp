@@ -15,7 +15,13 @@ std::string decode_block_32bp(const uint64_t block) {
 	s.reserve(32);
 	for (int i = 0; i < 32; ++i) {
 		const uint8_t val = (block >> (i * 2)) & 0x3;
-		const char c = "ACGT"[val];
+		char c = 'A';
+		if (val == 1)
+			c = 'C';
+		else if (val == 2)
+			c = 'G';
+		else if (val == 3)
+			c = 'T';
 		s += c;
 	}
 	return s;
@@ -77,12 +83,17 @@ void run_search_pass(
 	const std::string &query,
 	const bool is_forward,
 	const PinnedHostBuffer<uint64_t> &genome_buf,
-	const std::vector<ChromosomeRange> &chr_index
+	const BinaryLoader &epi_loader,
+	const std::vector<ChromosomeRange> &chr_index,
+	const std::vector<bool> &n_mask
 ) {
 	const uint64_t pattern = encode_dna_string(query);
 	const uint64_t mask = generate_care_mask(query.length(), is_forward);
+	constexpr int max_kernel_mismatches = 4;
 
-	SearchResults results = launch_bulge_search(genome_buf.data(), nullptr, genome_buf.size(), 0, pattern, mask, 3, 0);
+	SearchResults results = launch_bulge_search(
+		genome_buf.data(), epi_loader.data(), genome_buf.size(), epi_loader.size(), pattern, mask, max_kernel_mismatches, 0
+	);
 
 	for (size_t i = 0; i < results.count; ++i) {
 		const uint32_t raw_pos = results.matches[i];
@@ -107,18 +118,16 @@ void run_search_pass(
 			if (sub.length() < 23)
 				break;
 
-			bool pam_ok = false;
+			bool pam_valid = false;
 			if (is_forward) {
-				if (sub[21] == query[21] && sub[22] == query[22]) {
-					pam_ok = true;
-				}
+				if (sub[21] == 'G' && sub[22] == 'G')
+					pam_valid = true;
 			} else {
-				if (sub[0] == query[0] && sub[1] == query[1]) {
-					pam_ok = true;
-				}
+				if (sub[0] == 'C' && sub[1] == 'C')
+					pam_valid = true;
 			}
 
-			if (!pam_ok)
+			if (!pam_valid)
 				continue;
 
 			int mm = 0;
@@ -152,10 +161,11 @@ void run_search_pass(
 				return pos < range.start_idx;
 			}
 		);
+
 		std::string loc = "Unknown";
 		if (it != chr_index.begin()) {
 			const auto prev = std::prev(it);
-			const size_t relative_pos = global_base_pos - prev->start_idx + 1;
+			const size_t relative_pos = global_base_pos - prev->start_idx;
 			loc = prev->name + ":" + std::to_string(relative_pos);
 		}
 
@@ -167,27 +177,42 @@ void run_search_pass(
 
 int main(const int argc, char **argv) {
 	if (argc < 4) {
-		std::cerr << "Usage: " << argv[0] << " <fasta> <epi> <query>" << std::endl;
+		std::cerr << "Usage: " << argv[0] << " <fasta_file> <epi_file> <sequence>" << std::endl;
 		return 1;
 	}
 
 	const std::string fasta_path = argv[1];
+	const std::string epi_path = argv[2];
 	const std::string query_seq = argv[3];
-	std::cout << "[CORE] Starting Engine..." << std::endl;
-	std::cout << "[CORE] Query: " << query_seq << std::endl;
+
+	if (query_seq.length() < 23) {
+		std::cerr << "[ERROR] Sequence must be at least 23bp (20bp Spacer + 3bp PAM)" << std::endl;
+		return 1;
+	}
+
+	std::cout << "[CORE] Starting benchmark..." << std::endl;
+	std::cout << "[CORE] Query: " << query_seq << " (" << query_seq.length() << " bp)" << std::endl;
+	std::cout << "================================================================" << std::endl;
 
 	try {
 		const GenomeLoader loader(fasta_path);
+		const BinaryLoader epi_loader(epi_path);
+		std::cout << "[STEP 3] Sanitizing/Loading Cache..." << std::endl;
 		std::vector<ChromosomeRange> chr_index;
-		double t;
-		const std::vector<uint8_t> clean_data = sanitize_genome(fasta_path, loader.data(), loader.size(), chr_index, t);
+		std::vector<bool> n_mask;
+		double sanitize_time;
+		const std::vector<uint8_t> clean_data =
+			sanitize_genome(fasta_path, loader.data(), loader.size(), chr_index, n_mask, sanitize_time);
+		std::cout << "  > Clean Genome Size : " << clean_data.size() / (1024.0 * 1024.0) << " MB" << std::endl;
+		std::cout << "[STEP 4] Encoding (AVX2)..." << std::endl;
 		size_t num_blocks = (clean_data.size() + 31) / 32;
 		const auto pinned_genome = std::make_unique<PinnedHostBuffer<uint64_t>>(num_blocks);
 		encode_sequence_avx2(clean_data.data(), clean_data.size(), pinned_genome->data());
+		std::cout << "[STEP 5] GPU Search (Dual Strand)..." << std::endl;
 		std::cout << "----------------------------------------------------------------" << std::endl;
-		run_search_pass("(+)", query_seq, true, *pinned_genome, chr_index);
+		run_search_pass("(+)", query_seq, true, *pinned_genome, epi_loader, chr_index, n_mask);
 		const std::string rc_query = reverse_complement(query_seq);
-		run_search_pass("(-)", rc_query, false, *pinned_genome, chr_index);
+		run_search_pass("(-)", rc_query, false, *pinned_genome, epi_loader, chr_index, n_mask);
 		std::cout << "----------------------------------------------------------------" << std::endl;
 	} catch (const std::exception &e) {
 		std::cerr << "[FATAL] " << e.what() << std::endl;
