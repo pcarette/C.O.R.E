@@ -1,0 +1,7 @@
+{
+  "enzyme_name": "Cas12a",
+  "pam_pattern": "TTTG",
+  "pam_direction": "5_prime",
+  "target_len": 23,
+  "max_mismatches": 5
+}
