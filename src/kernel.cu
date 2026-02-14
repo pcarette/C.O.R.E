@@ -1,222 +1,143 @@
-#include <algorithm>
-#include <iostream>
-#include <vector>
-
 #include "gpu_utils.hpp"
 #include "kernel.hpp"
 
-constexpr uint8_t MASK_ATAC = 1 << 0;
 constexpr uint8_t MASK_BLACKLIST = 1 << 1;
 
+__device__ __forceinline__ int count_biological_mismatches(uint64_t seq, uint64_t pattern, uint64_t care_mask) {
+    uint64_t xor_diff = seq ^ pattern;
+    uint64_t bases_diff = (xor_diff | (xor_diff >> 1)) & 0x5555555555555555ULL;
+    bases_diff &= care_mask;
+    return __popcll(bases_diff);
+}
+
 __global__ void __launch_bounds__(256) k_search_bulge(
-	const uint64_t *__restrict__ genome,
-	const uint8_t *__restrict__ epigenome,
-	size_t n_blocks,
-	uint64_t pattern_val,
-	uint32_t *__restrict__ match_indices,
-	uint32_t *__restrict__ match_count,
-	uint32_t max_capacity,
-	size_t global_offset_blocks,
-	int max_mismatches,
-	int max_seed_mismatches
+    const uint64_t *__restrict__ genome,
+    const uint8_t *__restrict__ epigenome,
+    size_t n_blocks,
+    size_t epi_size,
+    uint64_t pattern_val,
+    uint64_t care_mask,
+    uint32_t *__restrict__ match_indices,
+    uint32_t *__restrict__ match_count,
+    uint32_t max_capacity,
+    int max_mismatches
 ) {
-	uint64_t local_pattern = pattern_val;
-	local_pattern = __shfl_sync(0xffffffff, local_pattern, 0);
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t stride = blockDim.x * gridDim.x;
 
-	size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-	size_t stride = blockDim.x * gridDim.x;
+    for (size_t i = idx; i < n_blocks; i += stride) {
+        uint64_t current = __ldg(&genome[i]);
+        uint64_t next = (i + 1 < n_blocks) ? __ldg(&genome[i+1]) : 0;
 
-	const uint64_t ODD_MASK = 0x5555555555555555ULL;
-	const uint64_t SEED_MASK_BASE = 0xFFFFF00000ULL;
-	const uint64_t GUIDE_MASK = 0xFFFFFFFFFFULL;
+        #pragma unroll
+        for (int offset = 0; offset < 32; ++offset) {
+            int shift = offset * 2;
+            uint64_t chunk = (shift == 0) ? current : (current >> shift) | (next << (64 - shift));
 
-	for (size_t i = idx; i < n_blocks; i += stride) {
-		uint64_t current = __ldg(&genome[i]);
-		uint64_t next = (i + 1 < n_blocks) ? __ldg(&genome[i+1]) : 0;
+            int mismatches = count_biological_mismatches(chunk, pattern_val, care_mask);
 
-		#pragma unroll
-		for (int offset = 0; offset < 32; ++offset) {
-			int shift = offset * 2;
-			uint64_t chunk = (shift == 0) ? current : (current >> shift) | (next << (64 - shift));
+            if (mismatches <= max_mismatches) {
+                size_t global_pos_bp = i * 32 + offset;
+                bool keep = true;
 
-			uint64_t xor_d = chunk ^ local_pattern;
-			uint64_t diff_d = (xor_d | (xor_d >> 1)) & ODD_MASK & GUIDE_MASK;
-			int total_d = __popcll(diff_d);
+                if (epigenome && global_pos_bp < epi_size) {
+                    uint8_t epi_val = epigenome[global_pos_bp];
+                    if (epi_val & MASK_BLACKLIST) {
+                        keep = false;
+                    }
+                }
 
-			uint64_t pat_l = local_pattern << 2;
-			uint64_t xor_l = chunk ^ pat_l;
-			uint64_t diff_l = (xor_l | (xor_l >> 1)) & ODD_MASK & GUIDE_MASK;
-			int total_l = __popcll(diff_l);
-
-			uint64_t pat_r = local_pattern >> 2;
-			uint64_t xor_r = chunk ^ pat_r;
-			uint64_t diff_r = (xor_r | (xor_r >> 1)) & ODD_MASK & GUIDE_MASK;
-			int total_r = __popcll(diff_r);
-
-			int best_score = max_mismatches + 1;
-
-			if (total_d <= max_mismatches) best_score = min(best_score, total_d);
-			if (total_l <= max_mismatches) best_score = min(best_score, total_l);
-			if (total_r <= max_mismatches) best_score = min(best_score, total_r);
-
-			if (best_score <= max_mismatches) {
-				size_t local_byte_idx = i * 32 + offset;
-				uint8_t epi_val = epigenome[local_byte_idx];
-				//bool is_accessible = (epi_val & MASK_ATAC);
-				bool not_blacklisted = !(epi_val & MASK_BLACKLIST);
-				//if (is_accessible && not_blacklisted) {
-				if (not_blacklisted) {
-					uint32_t write_idx = atomicAdd(match_count, 1);
-					if (write_idx < max_capacity) {
-						size_t global_pos = (global_offset_blocks + i) * 32 + offset;
-						match_indices[write_idx] = (uint32_t)global_pos;
-					}
-				}
-			}
-		}
-	}
+                if (keep) {
+                    uint32_t write_idx = atomicAdd(match_count, 1);
+                    if (write_idx < max_capacity) {
+                        match_indices[write_idx] = (uint32_t)global_pos_bp;
+                    }
+                }
+            }
+        }
+    }
 }
 
 SearchResults launch_bulge_search(
-	const uint64_t *genome_data,
-	const uint8_t *host_epigenome,
-	size_t num_elements,
-	size_t max_epi_size,
-	uint64_t pattern,
-	int max_mismatches,
-	int max_seed_mismatches
+    const uint64_t *genome_data,
+    const uint8_t *host_epigenome,
+    size_t num_blocks,
+    size_t epi_size,
+    uint64_t pattern,
+    uint64_t care_mask,
+    int max_mismatches,
+    int max_seed_mismatches
 ) {
-	SearchResults results;
-	results.count = 0;
-	results.capacity = 1024 * 1024;
-	results.matches = (uint32_t *)malloc(results.capacity * sizeof(uint32_t));
-	results.time_ms = 0.0f;
+    SearchResults results;
+    results.count = 0;
+    results.capacity = 1024 * 1024;
+    results.matches = (uint32_t *)malloc(results.capacity * sizeof(uint32_t));
+    results.time_ms = 0.0f;
 
-	CHECK_CUDA(cudaSetDevice(0));
+    int device = 0;
+    cudaSetDevice(device);
 
-	const int N_STREAMS = 2;
-	size_t chunk_elements = 50 * 1024 * 1024;
+    uint64_t *d_genome = nullptr;
+    uint8_t *d_epigenome = nullptr;
+    uint32_t *d_indices = nullptr;
+    uint32_t *d_count = nullptr;
 
-	std::cout << "[GPU] Pipeline: Double Buffering (2 Streams)" << std::endl;
+    size_t genome_bytes = num_blocks * sizeof(uint64_t);
+    size_t epi_bytes = epi_size * sizeof(uint8_t);
 
-	std::vector<DeviceBuffer<uint64_t> *> d_genome;
-	std::vector<DeviceBuffer<uint8_t> *> d_epigenome;
-	std::vector<DeviceBuffer<uint32_t> *> d_indices;
-	std::vector<DeviceBuffer<uint32_t> *> d_count;
-	std::vector<CudaStream> streams(N_STREAMS);
+    CHECK_CUDA(cudaMalloc(&d_genome, genome_bytes));
+    CHECK_CUDA(cudaMemcpy(d_genome, genome_data, genome_bytes, cudaMemcpyHostToDevice));
 
-	PinnedHostBuffer<uint32_t> h_counts(N_STREAMS);
-	std::vector<uint32_t *> h_indices_pinned;
+    if (host_epigenome && epi_size > 0) {
+        CHECK_CUDA(cudaMalloc(&d_epigenome, epi_bytes));
+        CHECK_CUDA(cudaMemcpy(d_epigenome, host_epigenome, epi_bytes, cudaMemcpyHostToDevice));
+    }
 
-	for(int i=0; i<N_STREAMS; ++i) {
-		d_genome.push_back(new DeviceBuffer<uint64_t>(chunk_elements));
-		d_epigenome.push_back(new DeviceBuffer<uint8_t>(chunk_elements * 32));
-		d_indices.push_back(new DeviceBuffer<uint32_t>(results.capacity / 4));
-		d_count.push_back(new DeviceBuffer<uint32_t>(1));
+    CHECK_CUDA(cudaMalloc(&d_indices, results.capacity * sizeof(uint32_t)));
+    CHECK_CUDA(cudaMalloc(&d_count, sizeof(uint32_t)));
+    CHECK_CUDA(cudaMemset(d_count, 0, sizeof(uint32_t)));
 
-		uint32_t *pin_ptr;
-		CHECK_CUDA(cudaMallocHost(&pin_ptr, (results.capacity / 4) * sizeof(uint32_t)));
-		h_indices_pinned.push_back(pin_ptr);
-	}
+    int threads = 256;
+    int blocks = (num_blocks + threads - 1) / threads;
+    if (blocks > 65535) blocks = 65535;
 
-	CudaEvent start, stop;
-	start.record();
+    CudaEvent start, stop;
+    start.record();
 
-	size_t processed = 0;
-	int batch_id = 0;
-	while (processed < num_elements) {
-		int sid = batch_id % N_STREAMS;
-		cudaStream_t stream = streams[sid].get();
-		if (batch_id >= N_STREAMS) {
-			streams[sid].synchronize();
-			uint32_t count = h_counts[sid];
-			if (count > 0) {
-				uint32_t to_copy = std::min(count, results.capacity - results.count);
-				if (to_copy > 0) {
-					memcpy(results.matches + results.count, h_indices_pinned[sid], to_copy * sizeof(uint32_t));
-					results.count += to_copy;
-				}
-			}
-		}
+    k_search_bulge<<<blocks, threads>>>(
+        d_genome,
+        d_epigenome,
+        num_blocks,
+        epi_size,
+        pattern,
+        care_mask,
+        d_indices,
+        d_count,
+        results.capacity,
+        max_mismatches
+    );
 
-		size_t current_batch = std::min(chunk_elements, num_elements - processed);
-		d_genome[sid]->copyFromHostAsync(genome_data + processed, current_batch, stream);
+    stop.record();
+    stop.synchronize();
+    results.time_ms = CudaEvent::elapsed(start, stop);
 
-		size_t epi_offset = processed * 32;
-		size_t epi_len_req = current_batch * 32;
-		size_t epi_len_safe = 0;
-		if (epi_offset < max_epi_size)
-			epi_len_safe = std::min(epi_len_req, max_epi_size - epi_offset);
-		if (epi_len_safe > 0)
-			d_epigenome[sid]->copyFromHostAsync(host_epigenome + epi_offset, epi_len_safe, stream);
+    uint32_t h_count = 0;
+    CHECK_CUDA(cudaMemcpy(&h_count, d_count, sizeof(uint32_t), cudaMemcpyDeviceToHost));
 
-		if (epi_len_safe < epi_len_req) {
-			CHECK_CUDA(cudaMemsetAsync(
-				d_epigenome[sid]->data() + epi_len_safe,
-				0,
-				epi_len_req - epi_len_safe,
-				stream
-			));
-		}
+    results.count = std::min(h_count, results.capacity);
+    if (results.count > 0) {
+        CHECK_CUDA(cudaMemcpy(results.matches, d_indices, results.count * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    }
 
-		CHECK_CUDA(cudaMemsetAsync(d_count[sid]->data(), 0, sizeof(uint32_t), stream));
-		int threads = 256;
-		int blocks = (current_batch + threads - 1) / threads;
-		if (blocks > 32768)
-			blocks = 32768;
-		k_search_bulge<<<blocks, threads, 0, stream>>>(
-			d_genome[sid]->data(),
-			d_epigenome[sid]->data(),
-			current_batch,
-			pattern,
-			d_indices[sid]->data(),
-			d_count[sid]->data(),
-			results.capacity / 4,
-			processed,
-			max_mismatches,
-			max_seed_mismatches
-		);
-		d_count[sid]->copyToHostAsync(&h_counts[sid], 1, stream);
-		CHECK_CUDA(cudaMemcpyAsync(
-			h_indices_pinned[sid],
-			d_indices[sid]->data(),
-			(results.capacity / 4) * sizeof(uint32_t),
-			cudaMemcpyDeviceToHost, stream)
-		);
-		processed += current_batch;
-		batch_id++;
-	}
+    if (d_genome) cudaFree(d_genome);
+    if (d_epigenome) cudaFree(d_epigenome);
+    if (d_indices) cudaFree(d_indices);
+    if (d_count) cudaFree(d_count);
 
-	for (int i = 0; i < N_STREAMS; ++i) {
-		streams[i].synchronize();
-		uint32_t count = h_counts[i];
-		if (count > 0) {
-			uint32_t to_copy = std::min(count, results.capacity - results.count);
-			if (to_copy > 0) {
-				memcpy(results.matches + results.count, h_indices_pinned[i], to_copy * sizeof(uint32_t));
-				results.count += to_copy;
-			}
-		}
-	}
-
-	stop.record();
-	stop.synchronize();
-	results.time_ms = CudaEvent::elapsed(start, stop);
-
-	for(int i=0; i<N_STREAMS; ++i) {
-		delete d_genome[i];
-		delete d_epigenome[i];
-		delete d_indices[i];
-		delete d_count[i];
-		cudaFreeHost(h_indices_pinned[i]);
-	}
-
-	return results;
+    return results;
 }
 
 void free_search_results(SearchResults &results) {
-	if (results.matches) {
-		free(results.matches);
-		results.matches = nullptr;
-	}
+    if (results.matches) free(results.matches);
+    results.matches = nullptr;
 }

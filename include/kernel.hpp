@@ -16,6 +16,7 @@ SearchResults launch_bulge_search(
 	size_t num_elements,
 	size_t max_epi_size,
 	uint64_t pattern,
+	uint64_t care_mask,
 	int max_mismatches,
 	int max_seed_mismatches
 );

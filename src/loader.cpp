@@ -1,31 +1,29 @@
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <fcntl.h>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
-#include <stdexcept>
 #include <string>
-#include <unistd.h>
-#include <utility>
-
 #include <sys/mman.h>
 #include <sys/stat.h>
-
-#include <immintrin.h>
+#include <unistd.h>
+#include <vector>
 
 #include "loader.hpp"
 
-#include <filesystem>
+#include <utility>
 
 namespace fs = std::filesystem;
+
+constexpr size_t CHROM_PADDING_BYTES = 16;
 
 void save_cache(const std::string &base_path, const std::vector<uint8_t> &data, const std::vector<ChromosomeRange> &index) {
 	std::string bin_path = base_path + ".cache.bin";
 	std::string idx_path = base_path + ".cache.idx";
-
 	std::ofstream out_data(bin_path, std::ios::binary);
 	out_data.write(reinterpret_cast<const char *>(data.data()), data.size());
-
 	std::ofstream out_idx(idx_path, std::ios::binary);
 	size_t count = index.size();
 	out_idx.write(reinterpret_cast<const char *>(&count), sizeof(count));
@@ -35,13 +33,11 @@ void save_cache(const std::string &base_path, const std::vector<uint8_t> &data, 
 		out_idx.write(chr.name.data(), name_len);
 		out_idx.write(reinterpret_cast<const char *>(&chr.start_idx), sizeof(chr.start_idx));
 	}
-	std::cout << "[LOADER] Cache created: " << bin_path << std::endl;
 }
 
 bool load_cache(const std::string &base_path, std::vector<uint8_t> &data, std::vector<ChromosomeRange> &index) {
 	std::string bin_path = base_path + ".cache.bin";
 	std::string idx_path = base_path + ".cache.idx";
-
 	if (!fs::exists(bin_path) || !fs::exists(idx_path))
 		return false;
 
@@ -55,7 +51,6 @@ bool load_cache(const std::string &base_path, std::vector<uint8_t> &data, std::v
 	size_t count = 0;
 	in_idx.read(reinterpret_cast<char *>(&count), sizeof(count));
 	index.clear();
-	index.reserve(count);
 	for (size_t i = 0; i < count; ++i) {
 		size_t name_len;
 		in_idx.read(reinterpret_cast<char *>(&name_len), sizeof(name_len));
@@ -71,7 +66,7 @@ bool load_cache(const std::string &base_path, std::vector<uint8_t> &data, std::v
 std::vector<uint8_t> sanitize_genome(
 	const std::string &filepath,
 	const uint8_t *raw_data,
-	const size_t raw_size,
+	size_t raw_size,
 	std::vector<ChromosomeRange> &index,
 	double &duration_ms
 ) {
@@ -79,82 +74,61 @@ std::vector<uint8_t> sanitize_genome(
 	std::vector<uint8_t> clean_data;
 
 	if (load_cache(filepath, clean_data, index)) {
-		const auto end_time = std::chrono::high_resolution_clock::now();
-		duration_ms = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start).count() / 1000.0;
-		std::cout << "[LOADER] Hot Cache Hit! (IO-Bound only)" << std::endl;
+		duration_ms = 0.0;
+		std::cout << "[LOADER] Cache loaded (" << clean_data.size() / 1024 / 1024 << " MB)" << std::endl;
 		return clean_data;
 	}
 
-	std::cout << "[LOADER] Cache miss. Starting AVX2 sanitization..." << std::endl;
-	clean_data.resize(raw_size);
+	std::cout << "[LOADER] Sanitizing Genome (Removing Ns, Adding Padding)..." << std::endl;
 
-	uint8_t *dst = clean_data.data();
-	const uint8_t *dst_start = clean_data.data();
+	clean_data.reserve(raw_size / 2);
+
 	const uint8_t *src = raw_data;
 	const uint8_t *end = raw_data + raw_size;
 
-	const __m256i thresh = _mm256_set1_epi8(32);
-	const __m256i gt_char = _mm256_set1_epi8('>');
-
 	while (src < end) {
 		if (*src == '>') {
+			if (!clean_data.empty()) {
+				for (size_t p = 0; p < CHROM_PADDING_BYTES; ++p)
+					clean_data.push_back(0);
+			}
+
 			const char *name_start = reinterpret_cast<const char *>(src) + 1;
-			const void *sep_space = std::memchr(name_start, ' ', end - src);
-			const void *sep_newline = std::memchr(name_start, '\n', end - src);
-			const char *name_end = reinterpret_cast<const char *>(end);
-			if (sep_space && sep_space < name_end)
-				name_end = static_cast<const char *>(sep_space);
-			if (sep_newline && sep_newline < name_end)
-				name_end = static_cast<const char *>(sep_newline);
-			const size_t current_offset = dst - dst_start;
-			index.push_back({std::string(name_start, name_end), current_offset});
-			if (const void *newline_pos = std::memchr(src, '\n', end - src))
-				src = static_cast<const uint8_t *>(newline_pos) + 1;
+			const char *name_end = name_start;
+			while (name_end < reinterpret_cast<const char *>(end) && *name_end != '\n' && *name_end != ' ') {
+				name_end++;
+			}
+
+			size_t current_idx_bases = clean_data.size();
+			index.push_back({std::string(name_start, name_end), current_idx_bases});
+			src = static_cast<const uint8_t *>(std::memchr(src, '\n', end - src));
+			if (src)
+				src++;
 			else
 				break;
 			continue;
 		}
 
-		while (src + 32 <= end) {
-			if (*src == '>')
-				break;
-
-			const __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(src));
-			const __m256i is_valid = _mm256_cmpgt_epi8(chunk, thresh);
-			const int mask = _mm256_movemask_epi8(is_valid);
-			const __m256i is_header = _mm256_cmpeq_epi8(chunk, gt_char);
-
-			if (const int header_mask = _mm256_movemask_epi8(is_header); header_mask != 0)
-				break;
-
-			if (mask == -1) {
-				_mm256_storeu_si256(reinterpret_cast<__m256i *>(dst), chunk);
-				dst += 32;
-				src += 32;
-			} else {
-				const uint8_t *limit = src + 32;
-				while (src < limit) {
-					if (*src == '>')
-						break;
-					if (*src > 32)
-						*dst++ = *src;
-					src++;
-				}
-			}
-		}
-
 		while (src < end && *src != '>') {
-			if (*src > 32)
-				*dst++ = *src;
+			if (uint8_t c = *src; c != '\n' && c != '\r') {
+				uint8_t val = 0;
+				c = c & 0xDF;
+				if (c == 'C')
+					val = 1;
+				else if (c == 'G')
+					val = 2;
+				else if (c == 'T')
+					val = 3;
+
+				clean_data.push_back(val);
+			}
 			src++;
 		}
 	}
 
-	const size_t actual_size = dst - clean_data.data();
-	clean_data.resize(actual_size);
 	save_cache(filepath, clean_data, index);
 	const auto end_time = std::chrono::high_resolution_clock::now();
-	duration_ms = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start).count() / 1000.0;
+	duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start).count();
 	return clean_data;
 }
 
@@ -162,17 +136,16 @@ GenomeLoader::GenomeLoader(const std::string &filepath) : data_(nullptr), size_(
 	fd_ = open(filepath.c_str(), O_RDONLY);
 	if (fd_ == -1)
 		throw std::runtime_error("GenomeLoader: Unable to open file " + filepath);
-
 	struct stat sb{};
 	if (fstat(fd_, &sb) == -1) {
 		close(fd_);
-		throw std::runtime_error("GenomeLoader: fstat error on " + filepath);
+		throw std::runtime_error("GenomeLoader: fstat error");
 	}
 	size_ = static_cast<size_t>(sb.st_size);
 	data_ = static_cast<uint8_t *>(mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd_, 0));
 	if (data_ == MAP_FAILED) {
 		close(fd_);
-		throw std::runtime_error("GenomeLoader: mmap error (OOM?)");
+		throw std::runtime_error("GenomeLoader: mmap error");
 	}
 	madvise(data_, size_, MADV_SEQUENTIAL);
 }
@@ -216,7 +189,7 @@ BinaryLoader::BinaryLoader(const std::string &filepath) : m_fd_(-1), m_size_(0),
 	m_data_ = static_cast<uint8_t *>(mmap(nullptr, m_size_, PROT_READ, MAP_PRIVATE, m_fd_, 0));
 	if (m_data_ == MAP_FAILED) {
 		close(m_fd_);
-		throw std::runtime_error("BinaryLoader: mmap failed for " + filepath);
+		throw std::runtime_error("BinaryLoader: mmap failed");
 	}
 
 	madvise(m_data_, m_size_, MADV_SEQUENTIAL);

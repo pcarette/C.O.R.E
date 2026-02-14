@@ -27,6 +27,15 @@ uint64_t encode_pattern_python(const std::string &seq) {
 	return pat;
 }
 
+uint64_t generate_care_mask(const std::string &seq) {
+	uint64_t mask = 0;
+	for (size_t i = 0; i < seq.size() && i < 32; ++i)
+		mask |= 3ULL << (i * 2);
+	if (seq.size() == 23)
+		mask &= ~(3ULL << (20 * 2));
+	return mask;
+}
+
 std::string decode_2bit(const uint64_t block) {
 	std::string s;
 	s.reserve(32);
@@ -69,13 +78,21 @@ public:
 		}
 
 		const uint64_t pattern = encode_pattern_python(pattern_seq);
+		const uint64_t mask = generate_care_mask(pattern_seq);
 		SearchResults results = launch_bulge_search(
-			pinned_genome_->data(), epi_loader_->data(), pinned_genome_->size(), epi_loader_->size(), pattern, max_mismatches, 0
+			pinned_genome_->data(),
+			epi_loader_->data(),
+			pinned_genome_->size(),
+			epi_loader_->size(),
+			pattern,
+			mask,
+			max_mismatches,
+			0
 		);
 		auto result_array = py::array_t<uint32_t>(results.count);
 		if (results.count > 0) {
 			const py::buffer_info buffer = result_array.request();
-			uint32_t *ptr = static_cast<uint32_t *>(buffer.ptr);
+			auto *ptr = static_cast<uint32_t *>(buffer.ptr);
 			std::memcpy(ptr, results.matches, results.count * sizeof(uint32_t));
 		}
 
