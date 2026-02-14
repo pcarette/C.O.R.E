@@ -8,6 +8,7 @@ mygene = "*"
 numpy = "*"
 openai = "*"
 pandas = "*"
+pybiomart = "*"
 
 [dev-packages]
 

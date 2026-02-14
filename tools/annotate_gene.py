@@ -1,8 +1,9 @@
-import mygene
 import re
 import subprocess
 import sys
 import os
+import pandas as pd
+from pybiomart import Server
 
 CORE_BINARY = "./cmake-build-release/core_runner"
 DATA_FASTA = "./data/hg38_full.fa"
@@ -13,40 +14,72 @@ def get_gene_info(coordinates):
     if not coordinates:
         return {}
 
-    mg = mygene.MyGeneInfo()
-    queries = []
-    for location in coordinates:
-        try:
-            chrom, pos = location.split(":")
-            pos = int(pos)
-            queries.append(f"{chrom}:{pos}-{pos + 23}")
-        except ValueError:
-            continue
-
-    print(f"[API] Querying MyGene.info for {len(queries)} sites...")
-
+    print("[API] Connecting to Ensembl Biomart (pybiomart)...")
     try:
-        results = mg.querymany(queries, scopes='genomic_pos', fields='symbol,name,type_of_gene', species='human',
-                               verbose=False)
+        server = Server(host='http://www.ensembl.org')
+        dataset = server.marts['ENSEMBL_MART_ENSEMBL'].datasets['hsapiens_gene_ensembl']
+
+        gene_annotations = dataset.query(
+            attributes=[
+                'external_gene_name',
+                'chromosome_name',
+                'start_position',
+                'end_position'
+            ]
+        )
+
+        gene_annotations.columns = [
+            'external_gene_name',
+            'chromosome_name',
+            'start_position',
+            'end_position'
+        ]
+
+        gene_annotations['start_position'] = pd.to_numeric(gene_annotations['start_position'], errors='coerce')
+        gene_annotations['end_position'] = pd.to_numeric(gene_annotations['end_position'], errors='coerce')
+
     except Exception as e:
-        print(f"[WARN] API error: {e}")
+        print(f"[WARN] Biomart connection failed: {e}")
         return {}
 
-    annot_map = {}
-    for res in results:
-        query_key = res.get('query')
-        hit_data = None
-        if 'symbol' in res:
-            hit_data = res
-        elif 'hits' in res and len(res['hits']) > 0:
-            hit_data = res['hits'][0]
+    print(f"[API] Mapping hits against {len(gene_annotations)} genes...")
 
-        if hit_data and 'symbol' in hit_data:
-            symbol = hit_data['symbol']
-            gtype = hit_data.get('type_of_gene', 'unknown')
-            annot_map[query_key] = f"{symbol} ({gtype})"
-        else:
-            annot_map[query_key] = "."
+    annot_map = {}
+
+    try:
+        genes_by_chr = dict(tuple(gene_annotations.groupby('chromosome_name')))
+    except KeyError as e:
+        print(f"[WARN] GroupBy failed: {e}")
+        return {}
+
+    for position in coordinates:
+        try:
+            chrom_full, pos_str = position.split(":")
+            pos = int(pos_str)
+
+            chrom = chrom_full.replace("chr", "")
+
+            if chrom in genes_by_chr:
+                ga_chr = genes_by_chr[chrom]
+
+                hits = ga_chr[
+                    (ga_chr["start_position"] <= pos) &
+                    (ga_chr["end_position"] >= pos)
+                    ]
+
+                if not hits.empty:
+                    genes = hits['external_gene_name'].unique()
+                    valid_genes = [str(g) for g in genes if g is not None and str(g) != 'nan']
+                    if valid_genes:
+                        annot_map[position] = ",".join(valid_genes)
+                    else:
+                        annot_map[position] = "."
+                else:
+                    annot_map[position] = "."
+            else:
+                annot_map[position] = "."
+        except Exception:
+            annot_map[position] = "ERR"
 
     return annot_map
 
@@ -104,14 +137,8 @@ def main():
     print("-" * 120)
 
     for hit in hits:
-        chrom, pos = hit['loc'].split(':')
-        pos_int = int(pos)
-
-        gene_label = "."
-        target_query = f"{chrom}:{pos_int}-{pos_int + 23}"
-
-        if target_query in annotations:
-            gene_label = annotations[target_query]
+        loc = hit['loc']
+        gene_label = annotations.get(loc, ".")
 
         parts = hit['raw_line'].split()
         try:
@@ -135,7 +162,7 @@ def main():
             except:
                 pass
 
-        print(f"{gene_label:<25} | {hit['loc']:<20} | {seq:<35} | {strand:<8} | {mis}")
+        print(f"{gene_label:<25} | {loc:<20} | {seq:<35} | {strand:<8} | {mis}")
 
 
 if __name__ == "__main__":
