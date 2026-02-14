@@ -143,3 +143,15 @@ public:
 		return ms;
 	}
 };
+
+__device__ __forceinline__ uint64_t load_window_unaligned(const uint64_t *genome, const size_t s_bit_idx, const size_t max_bits) {
+	const size_t word_idx = s_bit_idx / 64;
+	const size_t bit_offset = s_bit_idx % 64;
+	const uint64_t w1 = genome[word_idx];
+	if (bit_offset == 0)
+		return w1;
+	uint64_t w2 = 0;
+	if ((word_idx + 1) * 64 < max_bits)
+		w2 = genome[word_idx + 1];
+	return ((w1 >> bit_offset) | (w2 << (64 - bit_offset)));
+}

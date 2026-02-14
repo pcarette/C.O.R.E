@@ -1,234 +1,267 @@
+#include <condition_variable>
+#include <deque>
+#include <fstream>
+#include <mutex>
+#include <thread>
+
 #include "config.hpp"
-
-#include <algorithm>
-#include <cstring>
-#include <iomanip>
-#include <iostream>
-#include <memory>
-#include <vector>
-
 #include "encoder.hpp"
 #include "gpu_utils.hpp"
 #include "kernel.hpp"
 #include "loader.hpp"
 
-std::string decode_block_32bp(const uint64_t block) {
-	std::string s;
-	s.reserve(32);
-	for (int i = 0; i < 32; ++i) {
-		const uint8_t val = (block >> (i * 2)) & 0x3;
-		char c = 'A';
-		if (val == 1)
-			c = 'C';
-		else if (val == 2)
-			c = 'G';
-		else if (val == 3)
-			c = 'T';
-		s += c;
-	}
-	return s;
-}
+#include <algorithm>
+
+struct WriteJob {
+	std::string data;
+	bool done = false;
+};
+std::deque<WriteJob> q;
+std::mutex mtx;
+std::condition_variable cv;
 
 std::string reverse_complement(const std::string &seq) {
 	std::string rc = seq;
 	std::ranges::reverse(rc);
+
 	for (char &c : rc) {
-		if (c == 'A')
+		switch (std::toupper(static_cast<unsigned char>(c))) {
+		case 'A':
 			c = 'T';
-		else if (c == 'T')
+			break;
+		case 'T':
 			c = 'A';
-		else if (c == 'C')
+			break;
+		case 'C':
 			c = 'G';
-		else if (c == 'G')
+			break;
+		case 'G':
 			c = 'C';
+			break;
+		case 'N':
+			c = 'N';
+			break;
+		case 'R':
+			c = 'Y';
+			break;
+		case 'Y':
+			c = 'R';
+			break;
+		case 'S':
+			c = 'S';
+			break;
+		case 'W':
+			c = 'W';
+			break;
+		case 'K':
+			c = 'M';
+			break;
+		case 'M':
+			c = 'K';
+			break;
+		case 'B':
+			c = 'V';
+			break;
+		case 'D':
+			c = 'H';
+			break;
+		case 'H':
+			c = 'D';
+			break;
+		case 'V':
+			c = 'B';
+			break;
+		default:
+			c = 'N';
+			break;
+		}
 	}
 	return rc;
 }
 
 uint64_t encode_dna_string(const std::string &seq) {
-	uint64_t pattern_enc = 0;
-	for (size_t i = 0; i < seq.size(); ++i) {
-		uint8_t c = 0;
-		if (const char base = std::toupper(seq[i]); base == 'C')
-			c = 1;
-		else if (base == 'G')
-			c = 2;
-		else if (base == 'T')
-			c = 3;
-		pattern_enc |= static_cast<uint64_t>(c) << (i * 2);
+	if (seq.length() > 32) {
+		throw std::runtime_error("Séquence trop longue pour un encodage uint64 (max 32bp)");
 	}
+
+	uint64_t pattern_enc = 0;
+
+	for (size_t i = 0; i < seq.size(); ++i) {
+		uint64_t val = 0;
+
+		switch (std::toupper(static_cast<unsigned char>(seq[i]))) {
+		case 'A':
+			val = 0;
+			break;
+		case 'C':
+			val = 1;
+			break;
+		case 'G':
+			val = 2;
+			break;
+		case 'T':
+			val = 3;
+			break;
+		case 'N':
+			val = 0;
+			break;
+		default:
+			val = 0;
+			break;
+		}
+
+		pattern_enc |= (val << (i * 2));
+	}
+
 	return pattern_enc;
 }
 
-uint64_t generate_care_mask(const size_t len, const bool is_forward) {
-	uint64_t mask = 0;
-	for (size_t i = 0; i < len; ++i) {
-		bool care = true;
-		if (is_forward) {
-			if (i == 20)
-				care = false;
-		} else {
-			if (i == 2)
-				care = false;
-		}
-
-		if (care) {
-			mask |= 3ULL << (i * 2);
-		}
+void writer_thread(const std::string &path) {
+	std::ofstream f(path);
+	if (!f.is_open())
+		return;
+	f << "LOCATION\tCANDIDATE_SEQ\tMISMATCHES\tSTRAND\n";
+	while (true) {
+		std::unique_lock lk(mtx);
+		cv.wait(lk, [] { return !q.empty(); });
+		auto [data, done] = q.front();
+		q.pop_front();
+		lk.unlock();
+		if (done)
+			break;
+		f << data;
 	}
-
-	return mask;
 }
 
-void run_search_pass(
-	const std::string &label,
-	const std::string &query,
-	const bool is_forward,
-	const PinnedHostBuffer<uint64_t> &genome_buf,
-	const BinaryLoader &epi_loader,
-	const std::vector<ChromosomeRange> &chr_index,
-	const std::vector<bool> &n_mask
-) {
-	const uint64_t pattern = encode_dna_string(query);
-	const uint64_t mask = generate_care_mask(query.length(), is_forward);
-	constexpr int max_kernel_mismatches = 4;
+void submit_write(const std::string &s) {
+	if (s.empty())
+		return;
+	std::lock_guard lk(mtx);
+	q.push_back({s, false});
+	cv.notify_one();
+}
 
-	SearchResults results = launch_bulge_search(
-		genome_buf.data(), epi_loader.data(), genome_buf.size(), epi_loader.size(), pattern, mask, max_kernel_mismatches, 0
-	);
-
-	for (size_t i = 0; i < results.count; ++i) {
-		const uint32_t raw_pos = results.matches[i];
-		const uint32_t block_idx = raw_pos / 32;
-
-		if (block_idx >= genome_buf.size())
-			continue;
-
-		std::string raw_block = decode_block_32bp(genome_buf[block_idx]);
-		if (block_idx + 1 < genome_buf.size()) {
-			raw_block += decode_block_32bp(genome_buf[block_idx + 1]);
-		} else {
-			raw_block += "NNNNNNNN";
-		}
-
-		int best_mm = 999;
-		int best_offset = -1;
-		std::string matched_seq;
-
-		for (int off = 0; off < 32; ++off) {
-			std::string sub = raw_block.substr(off, 23);
-			if (sub.length() < 23)
-				break;
-
-			bool pam_valid = false;
-			if (is_forward) {
-				if (sub[21] == 'G' && sub[22] == 'G')
-					pam_valid = true;
-			} else {
-				if (sub[0] == 'C' && sub[1] == 'C')
-					pam_valid = true;
-			}
-
-			if (!pam_valid)
-				continue;
-
-			int mm = 0;
-			if (is_forward) {
-				for (int k = 0; k < 20; ++k) {
-					if (sub[k] != query[k])
-						mm++;
-				}
-			} else {
-				for (int k = 3; k < 23; ++k) {
-					if (sub[k] != query[k])
-						mm++;
-				}
-			}
-
-			if (mm <= 3) {
-				if (mm < best_mm) {
-					best_mm = mm;
-					best_offset = off;
-					matched_seq = sub;
-				}
-			}
-		}
-
-		if (best_offset == -1)
-			continue;
-
-		size_t global_base_pos = static_cast<size_t>(block_idx) * 32 + best_offset;
-		auto it = std::upper_bound(
-			chr_index.begin(), chr_index.end(), global_base_pos, [](const size_t pos, const ChromosomeRange &range) {
-				return pos < range.start_idx;
-			}
-		);
-
-		std::string loc = "Unknown";
-		if (it != chr_index.begin()) {
-			const auto prev = std::prev(it);
-			const size_t relative_pos = global_base_pos - prev->start_idx;
-			loc = prev->name + ":" + std::to_string(relative_pos);
-		}
-
-		std::cout << "    Hit Block " << std::left << std::setw(10) << block_idx << ": " << matched_seq
-				  << "    Position: " << std::setw(20) << loc << " Strand: " << label << " [Mis: " << best_mm << "]" << std::endl;
+std::string decode_32bp(const uint64_t b) {
+	std::string s(32, 'A');
+	for (int i = 0; i < 32; ++i) {
+		if (const uint8_t v = (b >> (i * 2)) & 3; v == 1)
+			s[i] = 'C';
+		else if (v == 2)
+			s[i] = 'G';
+		else if (v == 3)
+			s[i] = 'T';
 	}
-	free_search_results(results);
+	return s;
+}
+
+std::string get_rc(const std::string &s) {
+	std::string r = s;
+	std::ranges::reverse(r);
+	for (char &c : r) {
+		if (const char u = std::toupper(static_cast<unsigned char>(c)); u == 'A')
+			c = 'T';
+		else if (u == 'T')
+			c = 'A';
+		else if (u == 'C')
+			c = 'G';
+		else if (u == 'G')
+			c = 'C';
+		else if (u == 'R')
+			c = 'Y';
+		else if (u == 'Y')
+			c = 'R';
+	}
+	return r;
+}
+
+EnzymeConfig get_rev_config(const EnzymeConfig &fwd) {
+	EnzymeConfig rev = fwd;
+	if (fwd.pam_offset_correction > 0)
+		rev.pam_offset_correction = -fwd.target_len;
+	else
+		rev.pam_offset_correction = fwd.pam_len;
+	return rev;
 }
 
 int main(const int argc, char **argv) {
-	if (argc < 4) {
-		std::cerr << "Usage: " << argv[0] << " <fasta_file> <epi_file> <sequence> <config.json>" << std::endl;
+	if (argc < 5) {
+		std::cerr << "Usage: ./core_runner <genome.fa> <epi.bin> <query> <config.json>" << std::endl;
 		return 1;
 	}
 
-	const std::string fasta_path = argv[1];
-	const std::string epi_path = argv[2];
-	const std::string query_seq = argv[3];
-	const std::string config_path = argv[4];
-	EnzymeConfig enzyme_config;
-	try {
-		enzyme_config = ConfigLoader::load_from_json(config_path);
-	} catch (const std::exception& e) {
-		std::cerr << "[ERROR] Config loading failed: " << e.what() << std::endl;
-		return 1;
+	const EnzymeConfig cfg = ConfigLoader::load_from_json(argv[4]);
+	const GenomeLoader l(argv[1]);
+	std::vector<ChromosomeRange> idx;
+	std::vector<bool> nm;
+	double st;
+	const auto clean = sanitize_genome(argv[1], l.data(), l.size(), idx, nm, st);
+	const size_t nb = (clean.size() + 31) / 32;
+	PinnedHostBuffer<uint64_t> gb(nb);
+	encode_sequence_avx2(clean.data(), clean.size(), gb.data());
+	std::thread wt(writer_thread, "results.tsv");
+
+	auto run_pass = [&](const std::string &q_seq, const std::string &lbl, const EnzymeConfig &current_cfg) {
+		uint64_t p = 0;
+		for (size_t i = 0; i < std::min(q_seq.size(), static_cast<size_t>(32)); ++i) {
+			uint64_t v = 0;
+			if (const char b = std::toupper(q_seq[i]); b == 'C')
+				v = 1;
+			else if (b == 'G')
+				v = 2;
+			else if (b == 'T')
+				v = 3;
+			p |= (v << (i * 2));
+		}
+		uint64_t m = 0;
+		for (size_t i = 0; i < q_seq.size(); ++i)
+			m |= 3ULL << (i * 2);
+		auto res = launch_pipelined_search(gb.data(), nb, current_cfg, p, m);
+		std::string buf;
+		buf.reserve(1024 * 1024);
+		for (size_t i = 0; i < res.count; ++i) {
+			uint32_t pos = res.matches[i];
+			const uint32_t b_idx = pos / 32;
+			std::string ctx = decode_32bp(gb[b_idx]);
+			if (b_idx + 1 < nb)
+				ctx += decode_32bp(gb[b_idx + 1]);
+			const size_t local_off = pos % 32;
+			if (local_off + q_seq.size() > ctx.size())
+				continue;
+			std::string cand = ctx.substr(local_off, q_seq.size());
+			int mm = 0;
+			for (size_t k = 0; k < q_seq.size(); ++k)
+				if (cand[k] != q_seq[k])
+					mm++;
+
+			if (mm <= current_cfg.max_mismatches) {
+				const auto it = std::upper_bound(idx.begin(), idx.end(), pos, [](const size_t p, const ChromosomeRange &r) {
+					return p < r.start_idx;
+				});
+				const auto prev = std::prev(it);
+				buf += prev->name + ":" + std::to_string(pos - prev->start_idx) + "\t" + cand + "\t" + std::to_string(mm) + "\t" +
+					   lbl + "\n";
+
+				if (buf.size() > 8 * 1024 * 1024) {
+					submit_write(buf);
+					buf.clear();
+				}
+			}
+		}
+		submit_write(buf);
+		std::cout << "[RESULT] " << lbl << " Pass Complete. GPU Hits: " << res.count << std::endl;
+		free_search_results(res);
+	};
+
+	run_pass(argv[3], "(+)", cfg);
+	const EnzymeConfig rev_cfg = get_rev_config(cfg);
+	run_pass(get_rc(argv[3]), "(-)", rev_cfg);
+	{
+		std::lock_guard lk(mtx);
+		q.push_back({"", true});
+		cv.notify_one();
 	}
-	std::cout << &enzyme_config << std::endl;
+	wt.join();
 
-	if (query_seq.length() < 23) {
-		std::cerr << "[ERROR] Sequence must be at least 23bp (20bp Spacer + 3bp PAM)" << std::endl;
-		return 1;
-	}
-
-	std::cout << "[CORE] Starting benchmark..." << std::endl;
-	std::cout << "[CORE] Query: " << query_seq << " (" << query_seq.length() << " bp)" << std::endl;
-	std::cout << "================================================================" << std::endl;
-
-	try {
-		const GenomeLoader loader(fasta_path);
-		const BinaryLoader epi_loader(epi_path);
-		std::cout << "[STEP 3] Sanitizing/Loading Cache..." << std::endl;
-		std::vector<ChromosomeRange> chr_index;
-		std::vector<bool> n_mask;
-		double sanitize_time;
-		const std::vector<uint8_t> clean_data =
-			sanitize_genome(fasta_path, loader.data(), loader.size(), chr_index, n_mask, sanitize_time);
-		std::cout << "  > Clean Genome Size : " << clean_data.size() / (1024.0 * 1024.0) << " MB" << std::endl;
-		std::cout << "[STEP 4] Encoding (AVX2)..." << std::endl;
-		size_t num_blocks = (clean_data.size() + 31) / 32;
-		const auto pinned_genome = std::make_unique<PinnedHostBuffer<uint64_t>>(num_blocks);
-		encode_sequence_avx2(clean_data.data(), clean_data.size(), pinned_genome->data());
-		std::cout << "[STEP 5] GPU Search (Dual Strand)..." << std::endl;
-		std::cout << "----------------------------------------------------------------" << std::endl;
-		run_search_pass("(+)", query_seq, true, *pinned_genome, epi_loader, chr_index, n_mask);
-		const std::string rc_query = reverse_complement(query_seq);
-		run_search_pass("(-)", rc_query, false, *pinned_genome, epi_loader, chr_index, n_mask);
-		std::cout << "----------------------------------------------------------------" << std::endl;
-	} catch (const std::exception &e) {
-		std::cerr << "[FATAL] " << e.what() << std::endl;
-		return 1;
-	}
-
+	std::cout << "[CORE] Finalized. Check results.tsv for detailed sequences." << std::endl;
 	return 0;
 }

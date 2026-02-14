@@ -3,22 +3,15 @@
 #include <cstdint>
 #include <vector>
 
+#include "config.hpp"
+
 struct SearchResults {
 	uint32_t *matches;
-	uint32_t count;
-	uint32_t capacity;
-	float time_ms;
+	size_t count;
 };
 
-SearchResults launch_bulge_search(
-	const uint64_t *genome_data,
-	const uint8_t *host_epigenome,
-	size_t num_elements,
-	size_t max_epi_size,
-	uint64_t pattern,
-	uint64_t care_mask,
-	int max_mismatches,
-	int max_seed_mismatches
+SearchResults launch_pipelined_search(
+	const uint64_t *d_genome, size_t genome_num_u64, const EnzymeConfig &config, uint64_t query_pattern, uint64_t query_mask
 );
 
-void free_search_results(SearchResults &results);
+void free_search_results(SearchResults &res);
