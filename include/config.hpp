@@ -10,9 +10,12 @@ struct alignas(16) EnzymeConfig {
 	int target_len;
 	int pam_offset_correction;
 	int max_mismatches;
+	int seed_len;
+	int max_seed_mismatches;
 
-	explicit EnzymeConfig()
-		: pam_pattern(20), pam_care_mask(0), pam_len(0), target_len(0), pam_offset_correction(0), max_mismatches(0) {}
+	EnzymeConfig()
+		: pam_pattern(0), pam_care_mask(0), pam_len(0), target_len(0), pam_offset_correction(0), max_mismatches(0), seed_len(10),
+		  max_seed_mismatches(0) {}
 };
 
 class ConfigLoader {
