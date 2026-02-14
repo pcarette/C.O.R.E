@@ -46,6 +46,7 @@ target_compile_options(cuda_core PRIVATE
 )
 
 add_library(core_logic STATIC
+		src/config.cpp
 		src/loader.cpp
 		src/encoder.cpp
 )
