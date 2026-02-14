@@ -1,6 +1,8 @@
 #include <chrono>
 #include <cstring>
 #include <fcntl.h>
+#include <fstream>
+#include <iostream>
 #include <stdexcept>
 #include <string>
 #include <unistd.h>
@@ -13,11 +15,77 @@
 
 #include "loader.hpp"
 
-std::vector<uint8_t>
-sanitize_genome(const uint8_t *raw_data, const size_t raw_size, std::vector<ChromosomeRange> &index, double &duration_ms) {
-	const auto start = std::chrono::high_resolution_clock::now();
+#include <filesystem>
 
+namespace fs = std::filesystem;
+
+void save_cache(const std::string &base_path, const std::vector<uint8_t> &data, const std::vector<ChromosomeRange> &index) {
+	std::string bin_path = base_path + ".cache.bin";
+	std::string idx_path = base_path + ".cache.idx";
+
+	std::ofstream out_data(bin_path, std::ios::binary);
+	out_data.write(reinterpret_cast<const char *>(data.data()), data.size());
+
+	std::ofstream out_idx(idx_path, std::ios::binary);
+	size_t count = index.size();
+	out_idx.write(reinterpret_cast<const char *>(&count), sizeof(count));
+	for (const auto &chr : index) {
+		size_t name_len = chr.name.size();
+		out_idx.write(reinterpret_cast<const char *>(&name_len), sizeof(name_len));
+		out_idx.write(chr.name.data(), name_len);
+		out_idx.write(reinterpret_cast<const char *>(&chr.start_idx), sizeof(chr.start_idx));
+	}
+	std::cout << "[LOADER] Cache created: " << bin_path << std::endl;
+}
+
+bool load_cache(const std::string &base_path, std::vector<uint8_t> &data, std::vector<ChromosomeRange> &index) {
+	std::string bin_path = base_path + ".cache.bin";
+	std::string idx_path = base_path + ".cache.idx";
+
+	if (!fs::exists(bin_path) || !fs::exists(idx_path))
+		return false;
+
+	std::ifstream in_data(bin_path, std::ios::binary | std::ios::ate);
+	size_t data_size = in_data.tellg();
+	in_data.seekg(0);
+	data.resize(data_size);
+	in_data.read(reinterpret_cast<char *>(data.data()), data_size);
+
+	std::ifstream in_idx(idx_path, std::ios::binary);
+	size_t count = 0;
+	in_idx.read(reinterpret_cast<char *>(&count), sizeof(count));
+	index.clear();
+	index.reserve(count);
+	for (size_t i = 0; i < count; ++i) {
+		size_t name_len;
+		in_idx.read(reinterpret_cast<char *>(&name_len), sizeof(name_len));
+		std::string name(name_len, '\0');
+		in_idx.read(name.data(), name_len);
+		size_t start_idx;
+		in_idx.read(reinterpret_cast<char *>(&start_idx), sizeof(start_idx));
+		index.push_back({name, start_idx});
+	}
+	return true;
+}
+
+std::vector<uint8_t> sanitize_genome(
+	const std::string &filepath,
+	const uint8_t *raw_data,
+	const size_t raw_size,
+	std::vector<ChromosomeRange> &index,
+	double &duration_ms
+) {
+	const auto start = std::chrono::high_resolution_clock::now();
 	std::vector<uint8_t> clean_data;
+
+	if (load_cache(filepath, clean_data, index)) {
+		const auto end_time = std::chrono::high_resolution_clock::now();
+		duration_ms = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start).count() / 1000.0;
+		std::cout << "[LOADER] Hot Cache Hit! (IO-Bound only)" << std::endl;
+		return clean_data;
+	}
+
+	std::cout << "[LOADER] Cache miss. Starting AVX2 sanitization..." << std::endl;
 	clean_data.resize(raw_size);
 
 	uint8_t *dst = clean_data.data();
@@ -84,7 +152,7 @@ sanitize_genome(const uint8_t *raw_data, const size_t raw_size, std::vector<Chro
 
 	const size_t actual_size = dst - clean_data.data();
 	clean_data.resize(actual_size);
-
+	save_cache(filepath, clean_data, index);
 	const auto end_time = std::chrono::high_resolution_clock::now();
 	duration_ms = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start).count() / 1000.0;
 	return clean_data;

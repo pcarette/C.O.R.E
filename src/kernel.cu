@@ -8,10 +8,6 @@
 constexpr uint8_t MASK_ATAC = 1 << 0;
 constexpr uint8_t MASK_BLACKLIST = 1 << 1;
 
-__device__ __forceinline__ bool check_pam_cas9(uint64_t chunk, int bit_offset) {
-	return ((chunk >> (bit_offset + 2)) & 0xF) == 0xA;
-}
-
 __global__ void __launch_bounds__(256) k_search_bulge(
 	const uint64_t *__restrict__ genome,
 	const uint8_t *__restrict__ epigenome,
@@ -45,28 +41,24 @@ __global__ void __launch_bounds__(256) k_search_bulge(
 
 			uint64_t xor_d = chunk ^ local_pattern;
 			uint64_t diff_d = (xor_d | (xor_d >> 1)) & ODD_MASK & GUIDE_MASK;
-			int seed_d = __popcll(diff_d & SEED_MASK_BASE);
-			int total_d = (seed_d > max_seed_mismatches) ? 999 : __popcll(diff_d);
+			int total_d = __popcll(diff_d);
 
 			uint64_t pat_l = local_pattern << 2;
 			uint64_t xor_l = chunk ^ pat_l;
 			uint64_t diff_l = (xor_l | (xor_l >> 1)) & ODD_MASK & GUIDE_MASK;
-			int seed_l = __popcll(diff_l & (SEED_MASK_BASE << 2));
-			int total_l = (seed_l > max_seed_mismatches) ? 999 : __popcll(diff_l);
+			int total_l = __popcll(diff_l);
 
 			uint64_t pat_r = local_pattern >> 2;
 			uint64_t xor_r = chunk ^ pat_r;
 			uint64_t diff_r = (xor_r | (xor_r >> 1)) & ODD_MASK & GUIDE_MASK;
-			int seed_r = __popcll(diff_r & (SEED_MASK_BASE >> 2));
-			int total_r = (seed_r > max_seed_mismatches) ? 999 : __popcll(diff_r);
+			int total_r = __popcll(diff_r);
 
 			int best_score = max_mismatches + 1;
-			if (total_d <= max_mismatches && check_pam_cas9(chunk, 40))
-				best_score = min(best_score, total_d);
-			if (total_l <= max_mismatches && check_pam_cas9(chunk, 42))
-				best_score = min(best_score, total_l);
-			if (total_r <= max_mismatches && check_pam_cas9(chunk, 38))
-				best_score = min(best_score, total_r);
+
+			if (total_d <= max_mismatches) best_score = min(best_score, total_d);
+			if (total_l <= max_mismatches) best_score = min(best_score, total_l);
+			if (total_r <= max_mismatches) best_score = min(best_score, total_r);
+
 			if (best_score <= max_mismatches) {
 				size_t local_byte_idx = i * 32 + offset;
 				uint8_t epi_val = epigenome[local_byte_idx];

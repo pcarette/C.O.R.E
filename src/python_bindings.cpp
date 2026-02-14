@@ -57,7 +57,7 @@ public:
 		volatile uint8_t sink = 0;
 		for (size_t i = 0; i < loader.size(); i += 4096)
 			sink = raw[i];
-		const std::vector<uint8_t> clean_data = sanitize_genome(loader.data(), loader.size(), chr_index_, dummy_time);
+		const std::vector<uint8_t> clean_data = sanitize_genome(fasta_path, loader.data(), loader.size(), chr_index_, dummy_time);
 		size_t num_blocks = (clean_data.size() + 31) / 32;
 		pinned_genome_ = std::make_unique<PinnedHostBuffer<uint64_t>>(num_blocks);
 		encode_sequence_avx2(clean_data.data(), clean_data.size(), pinned_genome_->data());
