@@ -3,5 +3,5 @@
   "pam_pattern": "NGG",
   "pam_direction": "3_prime",
   "target_len": 20,
-  "max_mismatches": 3
+  "max_mismatches": 5
 }
