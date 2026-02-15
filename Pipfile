@@ -4,11 +4,12 @@ verify_ssl = true
 name = "pypi"
 
 [packages]
-mygene = "*"
 numpy = "*"
 openai = "*"
 pandas = "*"
+plotly = "*"
 pybiomart = "*"
+streamlit = "*"
 
 [dev-packages]
 
