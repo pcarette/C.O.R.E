@@ -38,13 +38,13 @@ void ConfigLoader::parse_pam_string(const std::string &pam_str, uint64_t &patter
 			p = 3;
 			m = 3;
 			break;
-		case 'N':
-			p = 0;
-			m = 0;
-			break;
 		case 'R':
 			p = 0;
 			m = 1;
+			break;
+		case 'N':
+			p = 0;
+			m = 0;
 			break;
 		default:
 			throw std::runtime_error("Invalid PAM base");
@@ -84,6 +84,6 @@ EnzymeConfig ConfigLoader::load_from_json(const std::string &filepath) {
 	if (pam_dir == "3_prime")
 		cfg.pam_offset_correction = -cfg.target_len;
 	else
-		cfg.pam_offset_correction = cfg.pam_len;
+		cfg.pam_offset_correction = 0;
 	return cfg;
 }
