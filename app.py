@@ -3,6 +3,7 @@ import os
 import sys
 import time
 import pandas as pd
+import numpy as np
 import plotly.express as px
 import streamlit as st
 from pybiomart import Server
@@ -12,50 +13,39 @@ st.set_page_config(
     page_title="C.O.R.E | Precision CRISPR Platform",
     page_icon="🧬",
     layout="wide",
-    initial_sidebar_state="collapsed"
+    initial_sidebar_state="expanded"
 )
 
 st.markdown("""
 <style>
-    .stApp {
-        background-color: #0e1117;
-    }
+    .stApp { background-color: #0e1117; }
 
     div[data-testid="stMetric"] {
         background-color: #1a1c24;
         border: 1px solid #2d2f36;
-        padding: 20px;
-        border-radius: 10px;
-        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
-        transition: transform 0.2s;
+        padding: 15px;
+        border-radius: 8px;
+        transition: all 0.2s ease-in-out;
     }
 
     div[data-testid="stMetric"]:hover {
-        transform: translateY(-2px);
         border-color: #00C9FF;
+        box-shadow: 0 0 15px rgba(0, 201, 255, 0.1);
     }
 
-    h1, h2, h3 {
-        font-family: 'Helvetica Neue', sans-serif;
-        font-weight: 700;
-    }
-
+    h1, h2, h3 { font-family: 'Helvetica Neue', sans-serif; font-weight: 700; }
     h1 {
         background: linear-gradient(90deg, #00C9FF 0%, #92FE9D 100%);
         -webkit-background-clip: text;
         -webkit-text-fill-color: transparent;
-        font-size: 3rem !important;
+        font-size: 2.5rem !important;
     }
 
-    div[data-testid="stDataFrame"] {
-        border: 1px solid #2d2f36;
-        border-radius: 8px;
-        overflow: hidden;
-    }
+    div[data-testid="stDataFrame"] { border: 1px solid #2d2f36; border-radius: 8px; }
 
-    .risk-high { color: #FF4B4B; font-weight: bold; border: 1px solid #FF4B4B; padding: 2px 8px; border-radius: 4px; }
-    .risk-med { color: #FFAA00; font-weight: bold; border: 1px solid #FFAA00; padding: 2px 8px; border-radius: 4px; }
-    .risk-low { color: #00CC96; font-weight: bold; border: 1px solid #00CC96; padding: 2px 8px; border-radius: 4px; }
+    .risk-high { color: #ff4b4b; background: rgba(255, 75, 75, 0.1); border: 1px solid #ff4b4b; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
+    .risk-med { color: #ffa700; background: rgba(255, 167, 0, 0.1); border: 1px solid #ffa700; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
+    .risk-low { color: #00cc96; background: rgba(0, 204, 150, 0.1); border: 1px solid #00cc96; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -83,30 +73,30 @@ for d in POSSIBLE_BUILD_DIRS:
         break
 
 if not CORE_LOADED:
-    st.error("CRITICAL: C++ Engine not found. Please compile the project first.")
+    st.error("CRITICAL: C++ Engine (`core_engine.so`) not found. Compile the project first.")
     st.stop()
 
 
 def get_chrom_rank(chrom_name):
     raw = str(chrom_name).replace("chr", "")
-    if raw.isdigit():
-        return int(raw)
+    if raw.isdigit(): return int(raw)
     if raw == "X": return 23
     if raw == "Y": return 24
-    if raw == "M" or raw == "MT": return 25
+    if raw in ["M", "MT"]: return 25
     return 99
 
 
 class CoreService:
     @staticmethod
     @st.cache_resource(show_spinner=False)
-    def get_engine(fasta_path: str):
+    def get_engine(fasta_path: str, epi_path: str):
         if not os.path.exists(fasta_path):
             st.error(f"Genome file not found: {fasta_path}")
             return None
-        print(f"[CORE] Loading Genome: {fasta_path}")
+        has_epi = os.path.exists(epi_path)
+        print(f"[CORE] Loading Genome: {fasta_path} | Epigenome: {epi_path if has_epi else 'None'}")
         try:
-            return core_engine.Engine(fasta_path)
+            return core_engine.Engine(fasta_path, epi_path if has_epi else "")
         except Exception as e:
             st.error(f"Engine Initialization Failed: {e}")
             return None
@@ -148,7 +138,7 @@ class BiodataService:
                 end = start + 25
 
                 res = self.dataset.query(
-                    attributes=['external_gene_name', 'description', 'gene_biotype'],
+                    attributes=['external_gene_name', 'description'],
                     filters={'chromosome_name': chrom, 'start': start, 'end': end}
                 )
 
@@ -158,8 +148,7 @@ class BiodataService:
                     if len(genes) > 0:
                         annotated.at[idx, 'Gene'] = ", ".join(genes)
                     if len(descs) > 0:
-                        clean_desc = descs[0].split("[")[0].strip()
-                        annotated.at[idx, "Description"] = clean_desc
+                        annotated.at[idx, "Description"] = descs[0].split("[")[0].strip()
         except Exception as e:
             print(f"[ERR] Annotation loop error: {e}")
 
@@ -177,24 +166,23 @@ class RiskAnalystService:
     def analyze_clinical_risk(self, hits_list: list):
         data_str = json.dumps(hits_list, indent=2)
         system_prompt = (
-            "You are a Clinical Bioinformatics AI. "
-            "Analyze these CRISPR off-target sites. "
-            "Return a JSON object with a key 'analysis' containing a list of objects. "
-            "Each object must have: 'id', 'gene_symbol', 'region_type' (Exon/Intron/Promoter), "
-            "'risk_level' (High/Medium/Low), and 'rationale' (Short clinical explanation). "
-            "NO MARKDOWN, ONLY JSON."
+            "You are a Clinical Bioinformatics AI specializing in CRISPR safety. "
+            "Analyze these off-target sites based on mismatches, gene function, and EPIGENETIC CONTEXT. "
+            "Context 'Open Chromatin' implies high accessibility and HIGH RISK of cleavage. "
+            "Context 'Blacklist' implies unreliable genomic region (likely artifact). "
+            "Return a JSON object with key 'analysis' containing a list of objects. "
+            "Each object: 'id', 'gene_symbol', 'risk_level' (High/Medium/Low), 'rationale'."
         )
-        user_prompt = f"Analyze this dataset:\n{data_str}"
 
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
+                    {"role": "user", "content": f"Analyze this dataset:\n{data_str}"}
                 ],
-                temperature=0.1,
-                max_tokens=4096,
+                temperature=0.2,
+                max_tokens=2048,
                 extra_body={"response_format": {"type": "json_object"}}
             )
             return response.choices[0].message.content
@@ -207,12 +195,18 @@ def main():
         st.header("🎛️ Control Panel")
         st.subheader("1. Genomic Data")
         fasta_path = st.text_input("Genome Path (.fa)", "./data/hg38_full.fa")
-        config_path = st.selectbox("Enzyme Model", ["./config/cas12a_config.json", "./config/spcas9_config.json"])
-        st.subheader("2. Intelligence")
-        api_key = st.text_input("NVIDIA API Key", type="password", help="Required for Clinical Analysis")
+        epi_path = st.text_input("Epigenome Path (.epi)", "./data/hg38_k562.epi")
+        config_path = st.selectbox("Enzyme Model", ["./config/spcas9_config.json", "./config/cas12a_config.json"])
+        st.subheader("2. Filters & Heuristics")
+        col_f1, col_f2 = st.columns(2)
+        with col_f1:
+            req_atac = st.checkbox("Require Open Chromatin", value=False, help="Show only targets in ATAC-seq peaks")
+        with col_f2:
+            hide_bl = st.checkbox("Hide Blacklisted", value=True, help="Remove ENCODE blacklist regions")
+        st.subheader("3. Intelligence")
+        api_key = st.text_input("NVIDIA API Key", type="password")
         st.markdown("---")
-        st.caption("C.O.R.E v1.0")
-        st.caption("Powered by NVIDIA CUDA & Nemotron")
+        st.caption("C.O.R.E v1.2 (Heuristic Enhanced)")
 
     col1, col2 = st.columns([0.8, 0.2])
     with col1:
@@ -220,18 +214,18 @@ def main():
         st.markdown("### CRISPR Off-target Real-time Engine")
     with col2:
         st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/2/21/Nvidia_logo.svg/1200px-Nvidia_logo.svg.png",
-                 width=150)
+                 width=120)
 
     engine = None
     if os.path.exists(fasta_path):
         with st.spinner("🚀 Booting C++ Hyper-Engine (AVX2/CUDA)..."):
-            engine = CoreService.get_engine(fasta_path)
+            engine = CoreService.get_engine(fasta_path, epi_path)
     else:
         st.error(f"❌ Genome file missing at {fasta_path}")
 
     st.markdown("<br>", unsafe_allow_html=True)
-    query = st.text_input("🧬 Enter Guide Sequence (5' -> 3')", "TTTGGGGTGATCAGACCCAACAGCAGG")
-    run = st.button("RUN DEEP SCAN", type="primary", width='stretch', disabled=(engine is None))
+    query = st.text_input("🧬 Enter Guide Sequence (20-23nt 5'->3')", "TTTGGGGTGATCAGACCCAACAGCAGG")
+    run = st.button("RUN DEEP SCAN", type="primary", use_container_width=True, disabled=(engine is None))
 
     if run and engine:
         t_start = time.time()
@@ -253,7 +247,8 @@ def main():
                 "pos": h.pos,
                 "seq": h.sequence,
                 "mm": h.mismatches,
-                "strand": h.strand
+                "strand": h.strand,
+                "epi_code": h.epi_code
             })
         df = pd.DataFrame(data)
 
@@ -262,9 +257,30 @@ def main():
             st.success("Target is highly specific. No off-targets found.")
             return
 
-        df['chr_rank'] = df['chrom'].apply(get_chrom_rank)
-        df = df.sort_values(["mm", "chr_rank", "pos"])
-        df = df.drop(columns=['chr_rank'])
+        status.write("Applying Epigenetic Masks & Heuristics...")
+        MASK_ATAC = 1
+        MASK_BLACKLIST = 2
+
+        df['is_atac'] = (df['epi_code'] & MASK_ATAC) > 0
+        df['is_blacklist'] = (df['epi_code'] & MASK_BLACKLIST) > 0
+
+        if req_atac:
+            df = df[df['is_atac']]
+        if hide_bl:
+            df = df[~df['is_blacklist']]
+
+        if df.empty:
+            status.update(label="All hits filtered out.", state="complete")
+            st.warning("Hits found, but all were filtered by epigenetic criteria.")
+            return
+
+        df['base_score'] = 100.0 / (df['mm'] + 1.0)
+        df['heuristic_score'] = df['base_score']
+
+        df['heuristic_score'] = np.where(df['is_atac'], df['heuristic_score'] * 1.5, df['heuristic_score'])
+        df['heuristic_score'] = np.where(df['is_blacklist'], df['heuristic_score'] * 0.5, df['heuristic_score'])
+        df = df.sort_values("heuristic_score", ascending=False)
+
         status.write("Connecting to Ensembl BioMart...")
         annotator = BiodataService()
         df_top = df.head(50).copy()
@@ -272,122 +288,113 @@ def main():
 
         status.update(label="Analysis Ready", state="complete", expanded=False)
 
-        kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-        kpi1.metric("Engine Latency", f"{t_search * 1000:.1f} ms")
-        kpi2.metric("Total Hits", len(df))
-        kpi3.metric("Critical Off-Targets (0-2mm)", len(df[df['mm'] <= 2]))
-        spec_score = max(0, 100 - (len(df[df['mm'] <= 3]) * 2))
-        kpi4.metric("Specificity Score", f"{spec_score}/100", delta=spec_score - 80)
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Engine Latency", f"{t_search * 1000:.1f} ms")
+        k2.metric("Total Hits", len(df))
 
-        col_chart_1, col_chart_2 = st.columns(2)
-        with col_chart_1:
-            st.subheader("Mismatch Distribution")
-            fig_hist = px.histogram(df, x="mm", nbins=6, color_discrete_sequence=["#00C9FF"], template="plotly_dark")
+        n_critical = len(df[(df['mm'] <= 2) | ((df['mm'] <= 3) & df['is_atac'])])
+        k3.metric("Critical Risks", n_critical, delta_color="inverse", delta=n_critical)
+
+        spec_score = max(0, 100 - (n_critical * 3))
+        k4.metric("Safety Score", f"{spec_score}/100", delta=spec_score - 85)
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.subheader("Risk Distribution (Heuristic)")
+            fig_hist = px.histogram(df, x="heuristic_score", nbins=20,
+                                    color_discrete_sequence=["#00C9FF"], template="plotly_dark",
+                                    title="Danger Score Distribution")
             fig_hist.update_layout(bargap=0.1, height=300)
-            st.plotly_chart(fig_hist, width="stretch")
+            st.plotly_chart(fig_hist, use_container_width=True)
 
-        with col_chart_2:
-            st.subheader("Chromosomal Spread")
-            df_chart = df.copy()
-            df_chart['chr_num'] = df_chart['chrom'].apply(get_chrom_rank)
-            df_chart = df_chart.sort_values('chr_num')
-            fig_scatter = px.scatter(
-                df_chart, x="chrom", y="pos", color="mm",
-                color_continuous_scale="Reds_r",
-                template="plotly_dark",
-                size_max=10,
-                hover_data=["seq"]
-            )
-            fig_scatter.update_xaxes(categoryorder='array', categoryarray=df_chart['chrom'].unique())
-            fig_scatter.update_layout(height=300)
-            st.plotly_chart(fig_scatter, width="stretch")
+        with c2:
+            st.subheader("Epigenetic Context")
+            atac_count = df['is_atac'].sum()
+            closed_count = len(df) - atac_count
+            fig_pie = px.pie(names=["Open Chromatin", "Closed/Unknown"], values=[atac_count, closed_count],
+                             color_discrete_sequence=["#00CC96", "#333"], template="plotly_dark", hole=0.4)
+            fig_pie.update_layout(height=300)
+            st.plotly_chart(fig_pie, use_container_width=True)
 
-        st.subheader("Genomic Candidates")
+        st.subheader("Top Candidates Analysis")
         st.dataframe(
-            df_annotated[['chrom', 'pos', 'Gene', 'Description', 'seq', 'mm', 'strand']],
+            df_annotated[['chrom', 'pos', 'Gene', 'seq', 'mm', 'is_atac', 'is_blacklist', 'heuristic_score']],
             column_config={
-                "mm": st.column_config.NumberColumn(
-                    "Mismatches",
-                    help="Lower is more dangerous",
-                    format="%d"
+                "heuristic_score": st.column_config.ProgressColumn(
+                    "Risk Score", format="%.1f", min_value=0, max_value=150,
+                    help="Calculated based on Mismatches + Epigenetics"
                 ),
-                "Gene": st.column_config.TextColumn("Gene Symbol", width="medium"),
-                "seq": st.column_config.TextColumn("Sequence", width="large"),
-                "Description": st.column_config.TextColumn("Function", width="large")
+                "is_atac": st.column_config.CheckboxColumn("Open Access", default=False),
+                "is_blacklist": st.column_config.CheckboxColumn("Blacklisted", default=False),
+                "mm": st.column_config.NumberColumn("Mismatches", format="%d"),
+                "Gene": st.column_config.TextColumn("Gene", width="medium"),
+                "seq": st.column_config.TextColumn("Sequence", width="large")
             },
-            width="stretch",
+            use_container_width=True,
             height=400
-        )
-
-        csv_data = df_annotated.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            label="📥 Download Full Report (CSV)",
-            data=csv_data,
-            file_name=f"core_report_{int(time.time())}.csv",
-            mime="text/csv"
         )
 
         if api_key:
             st.markdown("---")
-            st.subheader("AI Clinical Risk Assessment")
-            st.caption("Powered by NVIDIA LLAMA-3.3-Nemotron-Super-49b")
-
+            st.subheader("🤖 AI Clinical Risk Assessment")
             candidates_for_ai = df_annotated[
-                (df_annotated['Gene'] != ".") & (df_annotated['mm'] <= 5)
-                ].head(50)
+                (df_annotated['Gene'] != ".") &
+                (df_annotated['heuristic_score'] < 75)
+                ].head(20)
 
             if candidates_for_ai.empty:
-                st.info("No gene-associated risks found in top candidates. AI analysis skipped.")
+                st.info("No high-risk gene-associated targets found for AI analysis.")
             else:
                 payload = []
                 for idx, row in candidates_for_ai.iterrows():
+                    context_str = "Closed Chromatin"
+                    if row['is_atac']:
+                        context_str = "OPEN CHROMATIN (High Accessibility)"
+                    if row['is_blacklist']:
+                        context_str += ", BLACKLISTED REGION"
+
                     payload.append({
                         "id": idx,
                         "location": f"{row['chrom']}:{row['pos']}",
-                        "sequence": row['seq'],
                         "gene": row['Gene'],
-                        "mismatches": row['mm']
+                        "mismatches": row['mm'],
+                        "epigenetic_context": context_str
                     })
 
                 analyst = RiskAnalystService(api_key)
-                with st.spinner("Nemotron is analyzing gene functions and toxicity risks..."):
+                with st.spinner(f"Analyzing {len(payload)} critical targets with Nemotron-49b..."):
                     json_response = analyst.analyze_clinical_risk(payload)
 
                 if json_response:
                     try:
                         parsed = json.loads(json_response)
                         analysis_list = parsed.get("analysis", [])
-                        cols = st.columns(2)
+                        ac1, ac2 = st.columns(2)
                         for i, item in enumerate(analysis_list):
-                            with cols[i % 2]:
-                                r_lvl = item.get('risk_level', 'Unknown').lower()
-                                risk_class = "risk-low"
-                                border_color = "#00CC96"
-                                if r_lvl == "high":
-                                    risk_class = "risk-high"
-                                    border_color = "#FF4B4B"
-                                elif r_lvl == "medium":
-                                    risk_class = "risk-med"
-                                    border_color = "#FFAA00"
+                            col = ac1 if i % 2 == 0 else ac2
+                            r_lvl = item.get('risk_level', 'Unknown').lower()
 
-                                with st.container():
-                                    st.markdown(f"""
-                                    <div style="background-color: #262730; padding: 15px; border-radius: 8px; margin-bottom: 10px; border-left: 5px solid {border_color};">
-                                        <div style="display: flex; justify-content: space-between; align-items: center;">
-                                            <h4 style="margin: 0; color: white;">{item.get('gene_symbol', 'Unknown')}</h4>
-                                            <span class="{risk_class}">{item.get('risk_level', 'Unknown').upper()}</span>
-                                        </div>
-                                        <p style="color: #bbb; font-size: 0.9em; margin-top: 5px;"><b>Region:</b> {item.get('region_type', 'N/A')}</p>
-                                        <p style="color: #ddd; margin-top: 10px;">{item.get('rationale', 'No rationale provided.')}</p>
+                            border_c = "#00CC96"
+                            if "high" in r_lvl:
+                                border_c = "#FF4B4B"
+                            elif "medium" in r_lvl:
+                                border_c = "#FFAA00"
+
+                            with col:
+                                st.markdown(f"""
+                                <div style="background-color: #262730; padding: 15px; border-radius: 8px; margin-bottom: 10px; border-left: 5px solid {border_c};">
+                                    <div style="display: flex; justify-content: space-between;">
+                                        <h4 style="margin:0; color:white;">{item.get('gene_symbol', 'Unknown')}</h4>
+                                        <span style="color:{border_c}; font-weight:bold;">{item.get('risk_level', 'UNKNOWN').upper()}</span>
                                     </div>
-                                    """, unsafe_allow_html=True)
+                                    <p style="color:#ccc; font-size:0.9em; margin-top:5px;">{item.get('rationale', 'No rationale')}</p>
+                                </div>
+                                """, unsafe_allow_html=True)
 
                     except json.JSONDecodeError:
-                        st.warning("AI generated non-JSON response.")
+                        st.warning("AI Response Parse Error")
                 else:
-                    st.error("AI Analysis failed.")
-
-        st.toast(f"Analysis complete. {len(df)} hits processed.", icon="✅")
+                    st.error("AI Service Unavailable")
 
 
 if __name__ == "__main__":
