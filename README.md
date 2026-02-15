@@ -49,18 +49,18 @@ lifting.
 
 ```mermaid
 graph TD
-    User[Web Interface (Streamlit)] -->|Query| PyEngine[Python Orchestrator]
-    PyEngine -->|PyBind11| CppCore[C++ Core Logic]
+    User["Web Interface (Streamlit)"] -->|Query| PyEngine["Python Orchestrator"]
+    PyEngine -->|PyBind11| CppCore["C++ Core Logic"]
     
     subgraph "High-Performance Compute"
-        CppCore -->|AVX2 Encode| HostMem[Pinned Host Memory]
-        HostMem -->|DMA Transfer| GPUMem[Device Memory (VRAM)]
-        GPUMem -->|Parallel Scan| Kernel[CUDA Kernel (Bit-Matching)]
+        CppCore -->|AVX2 Encode| HostMem["Pinned Host Memory"]
+        HostMem -->|DMA Transfer| GPUMem["Device Memory (VRAM)"]
+        GPUMem -->|Parallel Scan| Kernel["CUDA Kernel (Bit-Matching)"]
     end
     
     Kernel -->|Results| PyEngine
-    PyEngine -->|Hits| BioMart[Ensembl BioMart]
-    PyEngine -->|Context| AI[NVIDIA Nemotron Agent]
+    PyEngine -->|Hits| BioMart["Ensembl BioMart"]
+    PyEngine -->|Context| AI["NVIDIA Nemotron Agent"]
     AI -->|Risk Report| User
 ```
 

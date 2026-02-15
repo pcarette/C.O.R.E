@@ -216,7 +216,7 @@ def main():
         st.title("C.O.R.E")
         st.markdown("### CRISPR Off-target Real-time Engine")
     with col2:
-        st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/2/21/Nvidia_logo.svg/1200px-Nvidia_logo.svg.png",
+        st.image("https://www.logo.wine/a/logo/Nvidia/Nvidia-Light-Horizontal-Dark-Background-Logo.wine.svg",
                  width=120)
 
     engine = None
