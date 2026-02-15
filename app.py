@@ -138,15 +138,18 @@ class BiodataService:
                 end = start + 25
 
                 res = self.dataset.query(
-                    attributes=['external_gene_name', 'description'],
+                    attributes=['external_gene_name', 'description', "ensembl_gene_id"],
                     filters={'chromosome_name': chrom, 'start': start, 'end': end}
                 )
 
                 if not res.empty:
                     genes = res["Gene name"].dropna().unique()
+                    ensembl_id = res["Gene stable ID"].dropna().unique()
                     descs = res["Gene description"].dropna().unique()
                     if len(genes) > 0:
                         annotated.at[idx, 'Gene'] = ", ".join(genes)
+                    else:
+                        annotated.at[idx, 'Gene'] = ", ".join(ensembl_id)
                     if len(descs) > 0:
                         annotated.at[idx, "Description"] = descs[0].split("[")[0].strip()
         except Exception as e:
