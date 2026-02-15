@@ -18,6 +18,7 @@ struct WriteJob {
 	std::string data;
 	bool done = false;
 };
+
 std::deque<WriteJob> q;
 std::mutex mtx;
 std::condition_variable cv;
@@ -32,12 +33,12 @@ void writer_thread(const std::string &path) {
 	while (true) {
 		std::unique_lock lk(mtx);
 		cv.wait(lk, [] { return !q.empty(); });
-		WriteJob j = q.front();
+		auto [data, done] = q.front();
 		q.pop_front();
 		lk.unlock();
-		if (j.done)
+		if (done)
 			break;
-		f << j.data;
+		f << data;
 	}
 }
 
@@ -49,6 +50,7 @@ void submit_write(const std::string &s) {
 	cv.notify_one();
 }
 
+// ReSharper disable once CppDFAConstantFunctionResult
 std::string decode_32bp(const uint64_t b) {
 	std::string s(32, 'A');
 	for (int i = 0; i < 32; ++i) {
@@ -127,6 +129,30 @@ EnzymeConfig generate_reverse_config(const EnzymeConfig &fwd) {
 	return rev;
 }
 
+std::vector<uint8_t> load_epigenome(const std::string &path, const size_t expected_size) {
+	std::cout << "[LOADER] Loading Epigenome atlas: " << path << std::endl;
+	std::ifstream f(path, std::ios::binary | std::ios::ate);
+	if (!f) {
+		std::cerr << "[ERROR] Epigenome file not found!" << std::endl;
+		exit(1);
+	}
+
+	const size_t size = f.tellg();
+	if (std::abs(static_cast<long long>(size) - static_cast<long long>(expected_size)) > 1024 * 1024) {
+		std::cerr << "[WARN] Size mismatch! Epi: " << size << " vs Genome: " << expected_size << std::endl;
+		std::cerr << "[WARN] Ensure chrom.sizes used for .epi matches the .fa file!" << std::endl;
+	}
+
+	f.seekg(0, std::ios::beg);
+	std::vector<uint8_t> buffer(size);
+	if (!f.read(reinterpret_cast<char *>(buffer.data()), size)) {
+		std::cerr << "[ERROR] Failed to read epigenome data." << std::endl;
+		exit(1);
+	}
+	std::cout << "[LOADER] Epigenome loaded (" << size / 1024 / 1024 << " MB). Ready for GPU." << std::endl;
+	return buffer;
+}
+
 int main(const int argc, char **argv) {
 	if (argc < 5) {
 		std::cerr << "Usage: ./core_runner <genome.fa> <epi.bin> <query> <config.json>" << std::endl;
@@ -139,6 +165,7 @@ int main(const int argc, char **argv) {
 	std::vector<bool> nm;
 	double st;
 	const auto clean = sanitize_genome(argv[1], l.data(), l.size(), idx, nm, st);
+	const auto epi_buffer = load_epigenome(argv[2], clean.size());
 	const size_t nb = (clean.size() + 31) / 32;
 	PinnedHostBuffer<uint64_t> gb(nb);
 	encode_sequence_avx2(clean.data(), clean.size(), gb.data());
@@ -149,7 +176,7 @@ int main(const int argc, char **argv) {
 		uint64_t m = 0;
 		for (size_t i = 0; i < q_seq.size(); ++i)
 			m |= 3ULL << (i * 2);
-		auto res = launch_pipelined_search(gb.data(), nb, current_cfg, p, m);
+		auto res = launch_pipelined_search(gb.data(), epi_buffer.data(), nb, current_cfg, p, m);
 		std::string buf;
 		buf.reserve(4 * 1024 * 1024);
 		for (size_t i = 0; i < res.count; ++i) {
@@ -170,13 +197,18 @@ int main(const int argc, char **argv) {
 					mm++;
 
 			if (mm <= current_cfg.max_mismatches) {
-				auto it = std::upper_bound(idx.begin(), idx.end(), pos, [](const size_t p, const ChromosomeRange &r) {
-					return p < r.start_idx;
+				auto it = std::upper_bound(idx.begin(), idx.end(), pos, [](const size_t ps, const ChromosomeRange &r) {
+					return ps < r.start_idx;
 				});
 				if (it != idx.begin()) {
 					const auto prev = std::prev(it);
+					std::string context_str = "Closed";
+					if (pos < epi_buffer.size()) {
+						if (epi_buffer[pos] & 1)
+							context_str = "ATAC_OPEN";
+					}
 					buf += prev->name + ":" + std::to_string(pos - prev->start_idx) + "\t" + cand + "\t" + std::to_string(mm) +
-						   "\t" + lbl + "\n";
+						   "\t" + lbl + "\t" + context_str + "\n";
 				}
 
 				if (buf.size() > 2 * 1024 * 1024) {

@@ -11,7 +11,7 @@ struct SearchResults {
 };
 
 SearchResults launch_pipelined_search(
-	const uint64_t *d_genome, size_t genome_num_u64, const EnzymeConfig &config, uint64_t query_pattern, uint64_t query_mask
+	const uint64_t *h_gen, const uint8_t *h_epi, size_t n, const EnzymeConfig &cfg, uint64_t pat, uint64_t mask
 );
 
 void free_search_results(SearchResults &res);

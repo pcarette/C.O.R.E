@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cmath>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -16,6 +17,7 @@
 
 namespace py = pybind11;
 
+// ReSharper disable once CppDFAConstantFunctionResult
 static std::string decode_32bp(const uint64_t b) {
 	std::string s(32, 'A');
 	for (int i = 0; i < 32; ++i) {
@@ -101,11 +103,13 @@ struct PyHit {
 	std::string sequence;
 	int mismatches;
 	std::string strand;
+	uint8_t epi_code;
 };
 
 class CoreEngine {
 	std::unique_ptr<GenomeLoader> loader;
 	std::unique_ptr<PinnedHostBuffer<uint64_t>> encoded_genome;
+	std::vector<uint8_t> epigenome_buffer;
 	std::vector<ChromosomeRange> chr_index;
 	std::vector<bool> n_mask;
 	size_t num_blocks;
@@ -117,7 +121,6 @@ class CoreEngine {
 		const EnzymeConfig &cfg,
 		std::vector<PyHit> &out
 	) {
-
 		for (size_t i = 0; i < raw.count; ++i) {
 			uint32_t pos = raw.matches[i];
 			const uint32_t b_idx = pos / 32;
@@ -151,6 +154,11 @@ class CoreEngine {
 					hit.sequence = cand;
 					hit.mismatches = mm;
 					hit.strand = strand;
+					if (pos < epigenome_buffer.size()) {
+						hit.epi_code = epigenome_buffer[pos];
+					} else {
+						hit.epi_code = 0;
+					}
 					out.push_back(hit);
 				}
 			}
@@ -158,7 +166,7 @@ class CoreEngine {
 	}
 
 public:
-	explicit CoreEngine(const std::string &fasta_path) {
+	explicit CoreEngine(const std::string &fasta_path, const std::string &epi_path = "") {
 		py::print("[C++] Loading Genome from:", fasta_path);
 		loader = std::make_unique<GenomeLoader>(fasta_path);
 		double dummy;
@@ -167,6 +175,34 @@ public:
 		encoded_genome = std::make_unique<PinnedHostBuffer<uint64_t>>(num_blocks);
 		py::print("[C++] Encoding Genome (AVX2)...");
 		encode_sequence_avx2(clean_data.data(), clean_data.size(), encoded_genome->data());
+		size_t genome_len = clean_data.size();
+		if (!epi_path.empty()) {
+			py::print("[C++] Loading Epigenome from:", epi_path);
+			if (std::ifstream epi_file(epi_path, std::ios::binary | std::ios::ate); epi_file) {
+				std::streamsize size = epi_file.tellg();
+				epi_file.seekg(0, std::ios::beg);
+				if (size > 0) {
+					epigenome_buffer.resize(size);
+					if (!epi_file.read(reinterpret_cast<char *>(epigenome_buffer.data()), size)) {
+						py::print("[WARN] Failed to read epigenome file.");
+						epigenome_buffer.assign(genome_len, 0);
+					} else {
+						py::print("[C++] Epigenome loaded (" + std::to_string(size / 1024 / 1024) + " MB)");
+					}
+				}
+			} else {
+				py::print("[WARN] Epigenome file not found or empty. Using blank mask.");
+				epigenome_buffer.resize(genome_len, 0);
+			}
+		} else {
+			py::print("[INFO] No epigenome provided. Running in sequence-only mode.");
+			epigenome_buffer.resize(genome_len, 0);
+		}
+
+		if (epigenome_buffer.size() < genome_len) {
+			epigenome_buffer.resize(genome_len, 0);
+		}
+
 		py::print("[C++] Ready.");
 	}
 
@@ -182,12 +218,12 @@ public:
 			uint64_t m_fwd = 0;
 			for (size_t i = 0; i < query.size(); ++i)
 				m_fwd |= 3ULL << (i * 2);
-			res_fwd = launch_pipelined_search(encoded_genome->data(), num_blocks, fwd_cfg, p_fwd, m_fwd);
+			res_fwd = launch_pipelined_search(encoded_genome->data(), epigenome_buffer.data(), num_blocks, fwd_cfg, p_fwd, m_fwd);
 			const uint64_t p_rev = encode_dna_string(rc_query);
 			uint64_t m_rev = 0;
 			for (size_t i = 0; i < rc_query.size(); ++i)
 				m_rev |= 3ULL << (i * 2);
-			res_rev = launch_pipelined_search(encoded_genome->data(), num_blocks, rev_cfg, p_rev, m_rev);
+			res_rev = launch_pipelined_search(encoded_genome->data(), epigenome_buffer.data(), num_blocks, rev_cfg, p_rev, m_rev);
 		}
 		process_hits(res_fwd, query, "(+)", fwd_cfg, results);
 		process_hits(res_rev, rc_query, "(-)", rev_cfg, results);
@@ -197,6 +233,7 @@ public:
 	}
 };
 
+// ReSharper disable once CppParameterMayBeConstPtrOrRef
 PYBIND11_MODULE(core_engine, m) {
 	m.doc() = "C.O.R.E High-Performance CRISPR Search Engine";
 
@@ -206,12 +243,13 @@ PYBIND11_MODULE(core_engine, m) {
 		.def_readonly("sequence", &PyHit::sequence)
 		.def_readonly("mismatches", &PyHit::mismatches)
 		.def_readonly("strand", &PyHit::strand)
+		.def_readonly("epi_code", &PyHit::epi_code)
 		.def("__repr__", [](const PyHit &h) {
 			return "<Hit " + h.chromosome + ":" + std::to_string(h.position) + " " + h.strand + " (" +
-				   std::to_string(h.mismatches) + "mm)>";
+				   std::to_string(h.mismatches) + "mm) epi:" + std::to_string(h.epi_code) + ">";
 		});
 
 	py::class_<CoreEngine>(m, "Engine")
-		.def(py::init<const std::string &>())
+		.def(py::init<const std::string &, const std::string &>(), py::arg("fasta_path"), py::arg("epi_path") = "")
 		.def("search", &CoreEngine::search);
 }
