@@ -1,8 +1,14 @@
-/*
-#include <pybind11/numpy.h>
+#include <algorithm>
+#include <cmath>
+#include <iostream>
+#include <memory>
+#include <string>
+#include <vector>
+
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include "config.hpp"
 #include "encoder.hpp"
 #include "gpu_utils.hpp"
 #include "kernel.hpp"
@@ -10,145 +16,202 @@
 
 namespace py = pybind11;
 
-uint64_t encode_pattern_python(const std::string &seq) {
-	uint64_t pat = 0;
-	for (size_t i = 0; i < seq.size() && i < 32; ++i) {
-		uint8_t code = 0;
-		const uint8_t c = std::toupper(seq[i]);
-		if (c == 'C')
-			code = 1;
-		else if (c == 'G')
-			code = 2;
-		else if (c == 'T')
-			code = 3;
-		else
-			code = 0;
-		pat |= static_cast<uint64_t>(code) << (i * 2);
-	}
-	return pat;
-}
-
-uint64_t generate_care_mask(const std::string &seq) {
-	uint64_t mask = 0;
-	for (size_t i = 0; i < seq.size() && i < 32; ++i)
-		mask |= 3ULL << (i * 2);
-	if (seq.size() == 23)
-		mask &= ~(3ULL << (20 * 2));
-	return mask;
-}
-
-std::string decode_2bit(const uint64_t block) {
-	std::string s;
-	s.reserve(32);
+static std::string decode_32bp(const uint64_t b) {
+	std::string s(32, 'A');
 	for (int i = 0; i < 32; ++i) {
-		if (const uint8_t val = (block >> (i * 2)) & 0x3; val == 0)
-			s += 'A';
-		else if (val == 1)
-			s += 'C';
-		else if (val == 2)
-			s += 'G';
-		else
-			s += 'T';
+		if (const uint8_t v = (b >> (i * 2)) & 3; v == 1)
+			s[i] = 'C';
+		else if (v == 2)
+			s[i] = 'G';
+		else if (v == 3)
+			s[i] = 'T';
 	}
 	return s;
 }
 
+static std::string get_rc(const std::string &s) {
+	std::string r = s;
+	std::ranges::reverse(r);
+	for (char &c : r) {
+		if (const char u = std::toupper(static_cast<unsigned char>(c)); u == 'A')
+			c = 'T';
+		else if (u == 'T')
+			c = 'A';
+		else if (u == 'C')
+			c = 'G';
+		else if (u == 'G')
+			c = 'C';
+		else if (u == 'R')
+			c = 'Y';
+		else if (u == 'Y')
+			c = 'R';
+		else if (u == 'N')
+			c = 'N';
+	}
+	return r;
+}
+
+static uint64_t encode_dna_string(const std::string &seq) {
+	uint64_t p = 0;
+	for (size_t i = 0; i < std::min(seq.size(), static_cast<size_t>(32)); ++i) {
+		uint64_t v = 0;
+		if (const char b = std::toupper(seq[i]); b == 'C')
+			v = 1;
+		else if (b == 'G')
+			v = 2;
+		else if (b == 'T')
+			v = 3;
+		p |= (v << (i * 2));
+	}
+	return p;
+}
+
+static EnzymeConfig generate_reverse_config(const EnzymeConfig &fwd) {
+	EnzymeConfig rev = fwd;
+	uint64_t new_pat = 0;
+	uint64_t new_mask = 0;
+
+	for (int i = 0; i < fwd.pam_len; ++i) {
+		const uint64_t shift_in = i * 2;
+		const uint64_t base_val = (fwd.pam_pattern >> shift_in) & 3;
+		const uint64_t mask_val = (fwd.pam_care_mask >> shift_in) & 3;
+		uint64_t rc_base = 3 - base_val;
+		const uint64_t rc_mask = mask_val;
+		if (rc_mask == 0)
+			rc_base = 0;
+
+		const int shift_out = (fwd.pam_len - 1 - i) * 2;
+		new_pat |= (rc_base << shift_out);
+		new_mask |= (rc_mask << shift_out);
+	}
+
+	rev.pam_pattern = new_pat;
+	rev.pam_care_mask = new_mask;
+	if (fwd.pam_offset_correction == 0)
+		rev.pam_offset_correction = -fwd.target_len;
+	else
+		rev.pam_offset_correction = 0;
+
+	return rev;
+}
+
+struct PyHit {
+	std::string chromosome;
+	uint32_t position;
+	std::string sequence;
+	int mismatches;
+	std::string strand;
+};
+
 class CoreEngine {
-	std::unique_ptr<PinnedHostBuffer<uint64_t>> pinned_genome_;
-	std::unique_ptr<BinaryLoader> epi_loader_;
-	std::vector<ChromosomeRange> chr_index_;
+	std::unique_ptr<GenomeLoader> loader;
+	std::unique_ptr<PinnedHostBuffer<uint64_t>> encoded_genome;
+	std::vector<ChromosomeRange> chr_index;
+	std::vector<bool> n_mask;
+	size_t num_blocks;
+
+	void process_hits(
+		const SearchResults &raw,
+		const std::string &q_seq,
+		const std::string &strand,
+		const EnzymeConfig &cfg,
+		std::vector<PyHit> &out
+	) {
+
+		for (size_t i = 0; i < raw.count; ++i) {
+			uint32_t pos = raw.matches[i];
+			const uint32_t b_idx = pos / 32;
+			if (b_idx >= num_blocks)
+				continue;
+
+			std::string ctx = decode_32bp((*encoded_genome)[b_idx]);
+			if (b_idx + 1 < num_blocks)
+				ctx += decode_32bp((*encoded_genome)[b_idx + 1]);
+
+			const size_t local_off = pos % 32;
+			if (local_off + q_seq.size() > ctx.size())
+				continue;
+
+			std::string cand = ctx.substr(local_off, q_seq.size());
+			int mm = 0;
+			for (size_t k = 0; k < q_seq.size(); ++k)
+				if (cand[k] != q_seq[k])
+					mm++;
+
+			if (mm <= cfg.max_mismatches) {
+				auto it = std::upper_bound(chr_index.begin(), chr_index.end(), pos, [](const size_t p, const ChromosomeRange &r) {
+					return p < r.start_idx;
+				});
+
+				if (it != chr_index.begin()) {
+					const auto prev = std::prev(it);
+					PyHit hit;
+					hit.chromosome = prev->name;
+					hit.position = pos - prev->start_idx;
+					hit.sequence = cand;
+					hit.mismatches = mm;
+					hit.strand = strand;
+					out.push_back(hit);
+				}
+			}
+		}
+	}
 
 public:
-	explicit CoreEngine(const std::string &fasta_path, const std::string &epi_path) {
-		const GenomeLoader loader(fasta_path);
-		epi_loader_ = std::make_unique<BinaryLoader>(epi_path);
-		double dummy_time;
-		const uint8_t *raw = loader.data();
-		volatile uint8_t sink = 0;
-		for (size_t i = 0; i < loader.size(); i += 4096)
-			sink = raw[i];
-		const std::vector<uint8_t> clean_data = sanitize_genome(fasta_path, loader.data(), loader.size(), chr_index_, dummy_time);
-		size_t num_blocks = (clean_data.size() + 31) / 32;
-		pinned_genome_ = std::make_unique<PinnedHostBuffer<uint64_t>>(num_blocks);
-		encode_sequence_avx2(clean_data.data(), clean_data.size(), pinned_genome_->data());
+	explicit CoreEngine(const std::string &fasta_path) {
+		py::print("[C++] Loading Genome from:", fasta_path);
+		loader = std::make_unique<GenomeLoader>(fasta_path);
+		double dummy;
+		const auto clean_data = sanitize_genome(fasta_path, loader->data(), loader->size(), chr_index, n_mask, dummy);
+		num_blocks = (clean_data.size() + 31) / 32;
+		encoded_genome = std::make_unique<PinnedHostBuffer<uint64_t>>(num_blocks);
+		py::print("[C++] Encoding Genome (AVX2)...");
+		encode_sequence_avx2(clean_data.data(), clean_data.size(), encoded_genome->data());
+		py::print("[C++] Ready.");
 	}
 
-	py::array_t<uint32_t> search(const std::string &pattern_seq, const int max_mismatches = 3) {
-		if (pattern_seq.length() > 32) {
-			throw std::runtime_error("Pattern length must be <= 32bp");
+	std::vector<PyHit> search(const std::string &query, const std::string &config_json_path) {
+		std::vector<PyHit> results;
+		const EnzymeConfig fwd_cfg = ConfigLoader::load_from_json(config_json_path);
+		const EnzymeConfig rev_cfg = generate_reverse_config(fwd_cfg);
+		const std::string rc_query = get_rc(query);
+		SearchResults res_fwd, res_rev;
+		{
+			py::gil_scoped_release release;
+			const uint64_t p_fwd = encode_dna_string(query);
+			uint64_t m_fwd = 0;
+			for (size_t i = 0; i < query.size(); ++i)
+				m_fwd |= 3ULL << (i * 2);
+			res_fwd = launch_pipelined_search(encoded_genome->data(), num_blocks, fwd_cfg, p_fwd, m_fwd);
+			const uint64_t p_rev = encode_dna_string(rc_query);
+			uint64_t m_rev = 0;
+			for (size_t i = 0; i < rc_query.size(); ++i)
+				m_rev |= 3ULL << (i * 2);
+			res_rev = launch_pipelined_search(encoded_genome->data(), num_blocks, rev_cfg, p_rev, m_rev);
 		}
-
-		const uint64_t pattern = encode_pattern_python(pattern_seq);
-		const uint64_t mask = generate_care_mask(pattern_seq);
-		SearchResults results = launch_bulge_search(
-			pinned_genome_->data(),
-			epi_loader_->data(),
-			pinned_genome_->size(),
-			epi_loader_->size(),
-			pattern,
-			mask,
-			max_mismatches,
-			0
-		);
-		auto result_array = py::array_t<uint32_t>(results.count);
-		if (results.count > 0) {
-			const py::buffer_info buffer = result_array.request();
-			auto *ptr = static_cast<uint32_t *>(buffer.ptr);
-			std::memcpy(ptr, results.matches, results.count * sizeof(uint32_t));
-		}
-
-		free_search_results(results);
-		return result_array;
-	}
-
-	std::pair<std::string, std::string> resolve_location(const uint32_t base_idx) {
-		const size_t global_base_pos = base_idx;
-		const auto it = std::upper_bound(
-			chr_index_.begin(), chr_index_.end(), global_base_pos, [](const size_t pos, const ChromosomeRange &range) {
-				return pos < range.start_idx;
-			}
-		);
-
-		std::string loc = "Unknown";
-		if (it != chr_index_.begin()) {
-			const auto prev = std::prev(it);
-			loc = prev->name + ":" + std::to_string(global_base_pos - prev->start_idx + 1);
-		}
-
-		const uint32_t block_idx = base_idx / 32;
-		if (block_idx >= pinned_genome_->size())
-			return {loc, "ERROR_OUT_OF_BOUNDS"};
-
-		return {loc, decode_2bit((*pinned_genome_)[block_idx])};
-	}
-
-	size_t get_genome_size_blocks() const {
-		return pinned_genome_->size();
+		process_hits(res_fwd, query, "(+)", fwd_cfg, results);
+		process_hits(res_rev, rc_query, "(-)", rev_cfg, results);
+		free_search_results(res_fwd);
+		free_search_results(res_rev);
+		return results;
 	}
 };
 
 PYBIND11_MODULE(core_engine, m) {
-	m.doc() = "C.O.R.E Engine";
-	py::class_<CoreEngine>(m, "CoreEngine")
-		.def(
-			py::init<const std::string &, const std::string &>(),
-			py::arg("fasta_path"),
-			py::arg("epi_path"),
-			"Init engine: load, clean and encode genome"
-		)
-		.def(
-			"search",
-			&CoreEngine::search,
-			py::arg("sequence"),
-			py::arg("max_mismatches") = 3,
-			"Search a sequence with a mismatch tolerance. Return a NumPy array of blocks ID's"
-		)
-		.def(
-			"resolve_location",
-			&CoreEngine::resolve_location,
-			py::arg("block_idx"),
-			"Convert a Block ID to genomic coordinates (chr:pos)"
-		)
-		.def_property_readonly("total_blocks", &CoreEngine::get_genome_size_blocks);
+	m.doc() = "C.O.R.E High-Performance CRISPR Search Engine";
+
+	py::class_<PyHit>(m, "Hit")
+		.def_readonly("chrom", &PyHit::chromosome)
+		.def_readonly("pos", &PyHit::position)
+		.def_readonly("sequence", &PyHit::sequence)
+		.def_readonly("mismatches", &PyHit::mismatches)
+		.def_readonly("strand", &PyHit::strand)
+		.def("__repr__", [](const PyHit &h) {
+			return "<Hit " + h.chromosome + ":" + std::to_string(h.position) + " " + h.strand + " (" +
+				   std::to_string(h.mismatches) + "mm)>";
+		});
+
+	py::class_<CoreEngine>(m, "Engine")
+		.def(py::init<const std::string &>())
+		.def("search", &CoreEngine::search);
 }
-*/
