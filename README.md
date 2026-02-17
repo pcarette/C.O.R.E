@@ -51,13 +51,13 @@ lifting.
 graph TD
     User["Web Interface (Streamlit)"] -->|Query| PyEngine["Python Orchestrator"]
     PyEngine -->|PyBind11| CppCore["C++ Core Logic"]
-    
+
     subgraph "High-Performance Compute"
         CppCore -->|AVX2 Encode| HostMem["Pinned Host Memory"]
         HostMem -->|DMA Transfer| GPUMem["Device Memory (VRAM)"]
         GPUMem -->|Parallel Scan| Kernel["CUDA Kernel (Bit-Matching)"]
     end
-    
+
     Kernel -->|Results| PyEngine
     PyEngine -->|Hits| BioMart["Ensembl BioMart"]
     PyEngine -->|Context| AI["NVIDIA Nemotron Agent"]
@@ -133,17 +133,21 @@ streamlit run app.py
 
 While this project was developed as a solo entry, it relies on deep domain knowledge:
 
-* [Lilia Ouadah] - Scientific Advisor
+* **Lilia Ouadah** - Scientific Advisor
     * I would like to express my sincere gratitude for her guidance on CRISPR biological constraints, off-target
       validation criteria, and clinical relevance. Her mentorship ensured that this engineering challenge remained
       grounded in biological reality.
+    * **Contact:** [l.ouadah@umcg.nl](mailto:l.ouadah@umcg.nl)
+    * **LinkedIn:** [Lilia Ouadah](https://www.linkedin.com/in/lilia-ouadah-435a591b8/)
 
 ---
 
 ## Author
 
 **Riyane El Qoqui**
-* [https://github.com/riyaneel/] | [https://www.linkedin.com/in/riyaneel/]
+
+* **GitHub:** [riyaneel](https://github.com/riyaneel/)
+* **LinkedIn:** [Riyane El Qoqui](https://www.linkedin.com/in/riyaneel/)
 
 > "Optimization is not just about speed; it's about making precision medicine accessible."
 
